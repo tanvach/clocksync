@@ -59,6 +59,48 @@ Emulates the following radio clock stations:
 * MSF (UK): [Wikipedia](https://en.wikipedia.org/wiki/Time_from_NPL_(MSF))
 * BPC (China): [51CTO article](https://harmonyos.51cto.com/posts/1731)
 
+## Hardware notes: M5 Atom Lite vs. generic ESP32/ESP32‑S3
+
+This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom library, default radio pin/power assumptions). It works great out-of-the-box on that device. For other ESP32 boards, a couple of tweaks may be required.
+
+### M5 Atom Lite (default)
+- Install the M5Atom library (Arduino Library Manager: "M5Atom").
+- Default wiring: connect a small loop antenna (e.g., ~30 cm wire) from `GPIO25` to GND via ~330 Ω.
+- The on-device RGB LED shows activity; the built-in button is not used.
+
+### Generic ESP32 (e.g., DevKit v1/WROOM)
+1) Libraries
+   - EITHER install the M5Atom library so the sketch compiles unchanged, OR remove M5-specific bits:
+     - Delete the include `#include <M5Atom.h>` and comment out lines that call `M5.begin()`, `M5.update()`, and `M5.dis.drawpix(...)` (search for `M5.` in `clocksync.ino`).
+2) Pins
+   - Set the radio output pin near the top of `clocksync.ino`: `#define PIN_RADIO (25)` works well on many boards; `GPIO26`/`GPIO27`/`GPIO33` are also typical.
+   - Avoid strapping pins and input-only pins:
+     - Classic ESP32 input-only: `GPIO34..GPIO39` (don’t use for `PIN_RADIO`).
+     - Boot/strap-sensitive: `GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`.
+   - Optional buzzer: set `#define PIN_BUZZ` to a valid GPIO or `-1` to disable (default off).
+3) Wiring
+   - Connect a small loop antenna from `PIN_RADIO` to GND via ~330 Ω resistor (very low-power magnetic coupling). Observe local RF regulations.
+4) Build/Flash
+   - Board: "ESP32 Dev Module" (Arduino IDE) or corresponding PlatformIO env.
+   - Open Serial Monitor at 115200 baud; browse `http://clocksync.local/` if mDNS is available.
+
+### ESP32‑S3 boards
+1) Board setup
+   - Board: "ESP32S3 Dev Module". If needed, enable USB CDC on boot in board options.
+2) Pins
+   - Choose any regular output-capable GPIO for `PIN_RADIO` (most S3 pins qualify). Avoid dedicated/strap pins like `GPIO0`, `GPIO2`, `GPIO46` depending on your module.
+3) M5Atom library
+   - If you’re not using an M5 device, install the M5Atom library just to satisfy includes, or comment out the `M5.` calls as noted above.
+4) Notes
+   - The carrier is generated with LEDC on all variants; the built-in `f` self-test (`frequency`) can verify your actual carrier by jumpering `PIN_RADIO` to `GPIO33` (or adjust the measurement pin in code if your board lacks `GPIO33`). Expected is ~40/60/77.5/68.5 kHz depending on station.
+
+### Minimal checklist to port
+- [ ] Set `PIN_RADIO` to a safe, output-capable GPIO for your board.
+- [ ] Install M5Atom library or comment out `M5.` calls.
+- [ ] Optionally set `PIN_BUZZ` or keep `-1`.
+- [ ] Configure `TZ` in `clocksync.ino` per your station.
+- [ ] Wire loop antenna with ~330 Ω to GND. Verify with `f` command.
+
 ## Protocol reference and compatibility notes
 
 - The data stream (minute frame layout and amplitude patterns) is based on and cross-checked with `txtempus`, a well-known Raspberry Pi/JETSON transmitter reference implementation. See: [hzeller/txtempus](https://github.com/hzeller/txtempus).
