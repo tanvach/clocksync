@@ -1247,7 +1247,7 @@ int docmd(char *buf) {
     } else {
       return 0;
     }
-    LOG_PRINTF("WWVB next-minute encoding: %s (ignored; txtempus defaults)\n", wwvbEncodeNextMinute ? "on" : "off");
+    LOG_PRINTF("WWVB next-minute encoding: %s (compatibility only; framing follows txtempus)\n", wwvbEncodeNextMinute ? "on" : "off");
     return 1;
   } else if (buf[0] == 'x' || buf[0] == 'X') {  // DST override
     if (buf[1] == '0') dstOverride = 0;         // STD
@@ -1262,7 +1262,7 @@ int docmd(char *buf) {
     else if (buf[1] == '1') wwvbPendingOverride = 1;
     else if (buf[1] == '2') wwvbPendingOverride = 2;
     else return 0;
-    LOG_PRINTF("WWVB pending override: %s (ignored; txtempus defaults)\n", wwvbPendingOverride == 2 ? "auto" : (wwvbPendingOverride ? "on" : "off"));
+    LOG_PRINTF("WWVB pending override: %s (compatibility only; framing follows txtempus)\n", wwvbPendingOverride == 2 ? "auto" : (wwvbPendingOverride ? "on" : "off"));
     saveSettings();
     return 1;
   } else if (buf[0] == 'r' || buf[0] == 'R') {  // reset to defaults and clear persisted settings
@@ -1312,7 +1312,7 @@ void printhelp(void) {
   LOG_PRINTF("  TZ      : %s\n", TZ);
   LOG_PRINTF("  Buzzer  : %s\n", buzzsw ? "on" : "off");
   LOG_PRINTF("  DST ov  : %s (applies to DCF/MSF; WWVB ignores)\n", dstOverride == 2 ? "auto" : (dstOverride ? "DST" : "STD"));
-  LOG_PRINTF("  WWVB    : txtempus framing (UTC; DST bits now/tomorrow). Overrides ignored.\n");
+  LOG_PRINTF("  WWVB    : framing matches 'txtempus' (reference Raspberry Pi transmitter); UTC; DST bits now/tomorrow auto.\n");
 
   LOG_PRINTLN("\nCommands:");
   LOG_PRINTLN("  h           : show this help");
@@ -1323,9 +1323,9 @@ void printhelp(void) {
   LOG_PRINTLN("  l0|l1       : LED off/on");
   LOG_PRINTLN("  pNN         : set radio output pin (e.g., p25)");
   LOG_PRINTLN("  f           : self-test: jumper radio pin to GPIO33, measure carrier");
-  LOG_PRINTLN("  n0|n1       : (WWVB) legacy; ignored (txtempus defaults)");
+  LOG_PRINTLN("  n0|n1       : (WWVB) compatibility only; no effect here (framing matches txtempus)");
   LOG_PRINTLN("  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB ignores)");
-  LOG_PRINTLN("  q0|q1|q2    : (WWVB) legacy; ignored (txtempus defaults)");
+  LOG_PRINTLN("  q0|q1|q2    : (WWVB) compatibility only; no effect here (framing matches txtempus)");
   LOG_PRINTLN("  sX          : set station to X (one of):");
   for (int i = 0; i < 7; i++) {
     LOG_PRINTF("    s%c : %s\n", stationCmds[i], stationNames[i]);
@@ -1349,7 +1349,7 @@ String generateStatusText(void) {
   s += "  Buzzer  : "; s += (buzzsw ? "on" : "off"); s += "\n";
   s += "  LED     : "; s += (ledEnabled ? "on" : "off"); s += "\n";
   s += "  DST ov  : "; s += (dstOverride==2?"auto":(dstOverride?"DST":"STD")); s += " (applies to DCF/MSF; WWVB ignores)\n";
-  s += "  WWVB    : txtempus framing (UTC; DST bits now/tomorrow). Overrides ignored.\n";
+  s += "  WWVB    : framing matches 'txtempus' (reference Raspberry Pi transmitter); UTC; DST bits now/tomorrow auto.\n";
   char tbuf[48];
   snprintf(tbuf, sizeof(tbuf), "  Now     : %04d-%02d-%02d %02d:%02d:%02d (local)\n",
            nowtm.tm_year + 1900, nowtm.tm_mon + 1, nowtm.tm_mday,
@@ -1364,9 +1364,9 @@ String generateStatusText(void) {
   s += "  l0|l1       : LED off/on\n";
   s += "  pNN         : set radio output pin (e.g., p25)\n";
   s += "  f           : self-test: jumper radio pin to GPIO33, measure carrier\n";
-  s += "  n0|n1       : (WWVB) legacy; ignored (txtempus defaults)\n";
+  s += "  n0|n1       : (WWVB) compatibility only; no effect here (framing matches txtempus)\n";
   s += "  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB ignores)\n";
-  s += "  q0|q1|q2    : (WWVB) legacy; ignored (txtempus defaults)\n";
+  s += "  q0|q1|q2    : (WWVB) compatibility only; no effect here (framing matches txtempus)\n";
   s += "  sX          : set station to X (one of):\n";
   for (int i = 0; i < 7; i++) {
     s += "    s"; s += stationCmds[i]; s += " : "; s += stationNames[i]; s += "\n";

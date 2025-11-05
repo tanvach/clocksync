@@ -15,6 +15,7 @@ The original copyright notice remains in the source file header.
 - Added simple HTTP server and mDNS service (`http` on port 80) for basic control/status.
 - Updated default pins/hardware notes (e.g., M5 Atom Lite) and cleaned comments.
 - Added `.gitignore` for common Arduino/PlatformIO artifacts and `secrets.h`.
+- Aligned WWVB minute framing and DST bit semantics with the proven reference implementation `txtempus` for predictability.
 
 ## WiFi credentials (secrets)
 
@@ -57,6 +58,11 @@ Emulates the following radio clock stations:
 * BSF (Taiwan): [Wikipedia](https://en.wikipedia.org/wiki/BSF_(time_service))
 * MSF (UK): [Wikipedia](https://en.wikipedia.org/wiki/Time_from_NPL_(MSF))
 * BPC (China): [51CTO article](https://harmonyos.51cto.com/posts/1731)
+
+## Protocol reference and compatibility notes
+
+- The data stream (minute frame layout and amplitude patterns) is based on and cross-checked with `txtempus`, a well-known Raspberry Pi/JETSON transmitter reference implementation. See: [hzeller/txtempus](https://github.com/hzeller/txtempus).
+- When this project mentions “txtempus framing” or “txtempus defaults” in logs/help, it means the on-air bit layout matches `txtempus`’s interpretation of the respective time service. Legacy toggles such as WWVB next-minute or pending overrides are accepted for compatibility but have no effect here; clocksync always encodes WWVB per the standard frame (UTC time-base; DST-now/tomorrow bits set automatically).
 
 ## Attribution
 
