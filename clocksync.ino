@@ -27,7 +27,7 @@
 
 //...................................................................
 // hardware config
-#define PIN_RADIO (25)  //(23)
+#define PIN_RADIO (25)
 #define PIN_BUZZ (-1)   // no onboard buzzer on M5 Atom Lite
 #define PIN_LED (-1)    // use M5 Atom RGB LED instead
 // Optional measurement input (jumper to radio pin for self-test)
