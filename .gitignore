@@ -1,0 +1,37 @@
+# Secrets
+secrets.h
+
+# macOS
+.DS_Store
+
+# Arduino/PlatformIO build artifacts
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE/editor
+.vscode/
+*.code-workspace
+
+# Firmware outputs
+*.bin
+*.elf
+*.hex
+*.map
+
+# Misc
+*.log
+*.bak
+# Local secrets (WiFi credentials)
+secrets.h
+
+# Build artifacts (common for Arduino/ESP)
+*.bin
+*.elf
+*.map
+*.pio
+.build/
+.DS_Store
+
+
