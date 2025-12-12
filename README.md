@@ -17,6 +17,7 @@ The original copyright notice remains in the source file header.
 - Added `.gitignore` for common Arduino/PlatformIO artifacts and `secrets.h`.
 - Aligned WWVB minute framing and DST bit semantics with the proven reference implementation `txtempus` for predictability.
 - Added GPIO drive-strength control (0-3) with web UI + persistence for safer antenna drive.
+  * Default drive strength is now `2`.
 
 ## WiFi credentials (secrets)
 
@@ -66,7 +67,7 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 
 ### M5 Atom Lite (default)
 - Install the M5Atom library (Arduino Library Manager: "M5Atom").
-- Default wiring: connect a small loop antenna (e.g., ~30 cm wire) from `GPIO25` to GND via ~330 Ω.
+- Default wiring: connect a small loop antenna (e.g., ~30 cm wire) from `GPIO32` to GND via ~330 Ω.
 - The on-device RGB LED shows activity; the built-in button is not used.
 
 ### Generic ESP32 (e.g., DevKit v1/WROOM)
@@ -74,7 +75,7 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
    - EITHER install the M5Atom library so the sketch compiles unchanged, OR remove M5-specific bits:
      - Delete the include `#include <M5Atom.h>` and comment out lines that call `M5.begin()`, `M5.update()`, and `M5.dis.drawpix(...)` (search for `M5.` in `clocksync.ino`).
 2) Pins
-   - Set the radio output pin near the top of `clocksync.ino`: `#define PIN_RADIO (25)` works well on many boards; `GPIO26`/`GPIO27`/`GPIO33` are also typical.
+   - Set the radio output pin near the top of `clocksync.ino`: `#define PIN_RADIO (32)` is the default and works well on many boards; `GPIO25`/`GPIO26`/`GPIO33` are also typical.
    - Avoid strapping pins and input-only pins:
      - Classic ESP32 input-only: `GPIO34..GPIO39` (don’t use for `PIN_RADIO`).
      - Boot/strap-sensitive: `GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`.
@@ -89,14 +90,14 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 1) Board setup
    - Board: "ESP32S3 Dev Module". If needed, enable USB CDC on boot in board options.
 2) Pins
-   - Choose any regular output-capable GPIO for `PIN_RADIO` (most S3 pins qualify). Avoid dedicated/strap pins like `GPIO0`, `GPIO2`, `GPIO46` depending on your module.
+   - Choose any regular output-capable GPIO for `PIN_RADIO` (most S3 pins qualify). Default is `GPIO32`. Avoid dedicated/strap pins like `GPIO0`, `GPIO2`, `GPIO46` depending on your module.
 3) M5Atom library
    - If you’re not using an M5 device, install the M5Atom library just to satisfy includes, or comment out the `M5.` calls as noted above.
 4) Notes
    - The carrier is generated with LEDC on all variants; the built-in `f` self-test (`frequency`) can verify your actual carrier by jumpering `PIN_RADIO` to `GPIO33` (or adjust the measurement pin in code if your board lacks `GPIO33`). Expected is ~40/60/77.5/68.5 kHz depending on station.
 
 ### Minimal checklist to port
-- [ ] Set `PIN_RADIO` to a safe, output-capable GPIO for your board.
+- [ ] Set `PIN_RADIO` to a safe, output-capable GPIO for your board (`32` by default).
 - [ ] Install M5Atom library or comment out `M5.` calls.
 - [ ] Optionally set `PIN_BUZZ` or keep `-1`.
 - [ ] Configure `TZ` in `clocksync.ino` per your station.
@@ -106,6 +107,87 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 
 - The data stream (minute frame layout and amplitude patterns) is based on and cross-checked with `txtempus`, a well-known Raspberry Pi/JETSON transmitter reference implementation. See: [hzeller/txtempus](https://github.com/hzeller/txtempus).
 - When this project mentions “txtempus framing” or “txtempus defaults” in logs/help, it means the on-air bit layout matches `txtempus`’s interpretation of the respective time service. Legacy toggles such as WWVB next-minute or pending overrides are accepted for compatibility but have no effect here; clocksync always encodes WWVB per the standard frame (UTC time-base; DST-now/tomorrow bits set automatically).
+
+## Home Assistant scheduling (optional)
+
+If you want to run the sync signal only during a daily window (e.g., at night), you can keep this firmware and have Home Assistant call the built-in HTTP command endpoint.
+
+Prereqs:
+- Device is on WiFi and reachable at `http://clocksync.local/` (mDNS/Bonjour), or replace `clocksync.local` with the device IP address.
+- You can verify the API by visiting `http://clocksync.local/status.txt` in a browser.
+
+### TX enable/disable command
+
+This fork adds a TX enable/disable command:
+- `e1`: enable TX (start carrier + modulation scheduler)
+- `e0`: disable TX (stop carrier + modulation scheduler)
+
+Commands work over both USB serial and HTTP:
+- `GET http://clocksync.local/cmd?c=e1`
+- `GET http://clocksync.local/cmd?c=e0`
+
+### Home Assistant `rest_command`
+
+Add this to your `configuration.yaml`:
+
+```yaml
+rest_command:
+  clocksync_cmd:
+    url: "http://clocksync.local/cmd?c={{ cmd | urlencode }}"
+    method: GET
+```
+
+Restart Home Assistant (or reload YAML if you prefer).
+
+### Example automation: run TX daily for 10 minutes
+
+```yaml
+automation:
+  - id: clocksync_daily_tx_window
+    alias: "clocksync: daily TX window"
+    mode: single
+    trigger:
+      - platform: time
+        at: "03:00:00"
+    action:
+      - service: rest_command.clocksync_cmd
+        data:
+          cmd: "e1"
+      - delay: "00:10:00"
+      - service: rest_command.clocksync_cmd
+        data:
+          cmd: "e0"
+```
+
+Tip: many radio clocks need multiple full minute frames to sync reliably. If you have trouble, increase the window (e.g., 15–30 minutes).
+
+### Other useful commands for automations
+
+You can combine these with the same `rest_command` (one call per command):
+- Station select: `sX` where X is one of `j` (JJY_E), `k` (JJY_W), `w` (WWVB), `d` (DCF77), `t` (BSF), `m` (MSF), `c` (BPC). Example: `cmd: "sw"` for WWVB.
+- Drive strength: `g0|g1|g2|g3` (0 = weakest, 3 = strongest). Example: `cmd: "g1"`.
+- DST override (DCF/MSF only): `x0|x1|x2` for STD / DST / AUTO.
+
+Example automation that sets station + drive, then runs TX for 15 minutes:
+
+```yaml
+automation:
+  - id: clocksync_nightly_dcf77
+    alias: "clocksync: nightly DCF77 window"
+    trigger:
+      - platform: time
+        at: "02:30:00"
+    action:
+      - service: rest_command.clocksync_cmd
+        data: { cmd: "sd" }   # DCF77
+      - service: rest_command.clocksync_cmd
+        data: { cmd: "g1" }   # moderate drive
+      - service: rest_command.clocksync_cmd
+        data: { cmd: "e1" }   # TX on
+      - delay: "00:15:00"
+      - service: rest_command.clocksync_cmd
+        data: { cmd: "e0" }   # TX off
+```
 
 ## Attribution
 

@@ -27,9 +27,9 @@
 
 //...................................................................
 // hardware config
-// Radio output pin (default 25). Grove pins 26 or 32 also work if you prefer using the Grove port;
+// Radio output pin (default 32). Grove pins 25 or 26 also work if you prefer using the Grove port;
 // avoid them if you need I2C on SDA/SCL. Stay within isSafeAtomPin().
-#define PIN_RADIO (25)
+#define PIN_RADIO (32)
 // note: {pin -> 330ohm -> 30cm loop antenna -> GND} works
 //     (33mW, but detuned length (super shorten), only very weak radiowave emitted).
 #define PIN_BUZZ (-1)   // no onboard buzzer on M5 Atom Lite
@@ -265,6 +265,8 @@ volatile SemaphoreHandle_t timerSemaphore;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t buzzup = 0;  // inc if buzz cycle (/2) passed
 int istimerstarted = 0;
+// TX enable/disable (controls whether the carrier + modulation scheduler are running)
+int txEnabled = 1;  // 1=enabled, 0=disabled
 
 int radioc = 0;  // 0..(RADIODIV - 1)
 int ampc = 0;    // 0..(AMPDIV - 1)
@@ -273,7 +275,7 @@ int tssec = 0;   // 0..(SSECDIV - 1)
 // Radio output GPIO (runtime configurable)
 volatile int pinRadio = PIN_RADIO;
 // GPIO drive strength (0=weakest..3=strongest)
-int driveStrength = GPIO_DRIVE_CAP_3;
+int driveStrength = GPIO_DRIVE_CAP_2;
 
 int currentStation = SN_DEFAULT;
 
@@ -437,8 +439,8 @@ void setup(void) {
     }
   }
   //  setdoydow();
-  setstation(currentStation);  // start LEDC carrier + aligned ticks
-  LOG_PRINT("radio started.\n");
+  setstation(currentStation);  // will start carrier only if txEnabled
+  LOG_PRINT(txEnabled ? "radio started.\n" : "radio disabled (TX off).\n");
 }
 
 
@@ -601,7 +603,9 @@ void setstation(int station) {
   makebitpattern = st_makebits[station];
   makebitpattern();
   printbits60();
-  starttimer();
+  if (txEnabled) {
+    starttimer();
+  }
   return;
 }
 
@@ -1208,8 +1212,24 @@ int docmd(char *buf) {
     pinMode(pinRadio, OUTPUT);
     digitalWrite(pinRadio, LOW);
     applyDriveStrength();
-    starttimer();
+    if (txEnabled) {
+      starttimer();
+    }
     LOG_PRINTF("radio pin set to %d\n", pinRadio);
+    saveSettings();
+    return 1;
+  } else if (buf[0] == 'e' || buf[0] == 'E') {  // TX enable/disable
+    if (buf[1] == '0') {
+      txEnabled = 0;
+      stoptimer();
+      lastCmdResp = String("TX disabled\n");
+    } else if (buf[1] == '1') {
+      txEnabled = 1;
+      starttimer();
+      lastCmdResp = String("TX enabled\n");
+    } else {
+      return 0;
+    }
     saveSettings();
     return 1;
   } else if (buf[0] == 'g' || buf[0] == 'G') {  // set GPIO drive strength 0..3
@@ -1324,6 +1344,7 @@ void printbits60(void) {
 void printhelp(void) {
   LOG_PRINTLN("Status:");
   LOG_PRINTF("  Station : %s\n", stationNames[currentStation]);
+  LOG_PRINTF("  TX      : %s\n", txEnabled ? "enabled" : "disabled");
   int carrierHz = radiodiv * 500;  // radiodiv is double-freq in kHz
   LOG_PRINTF("  Carrier : %d Hz (%.1f kHz)\n", carrierHz, (float)carrierHz / 1000.0);
   LOG_PRINTF("  Pin     : GPIO %d\n", pinRadio);
@@ -1336,6 +1357,7 @@ void printhelp(void) {
 
   LOG_PRINTLN("\nCommands:");
   LOG_PRINTLN("  h           : show this help");
+  LOG_PRINTLN("  e0|e1       : TX disable/enable (stop/start carrier + modulation)");
   LOG_PRINTLN("  y0|y1       : NTP sync off/on");
   LOG_PRINTLN("  dYYMMDD     : set date (interpreted in local TZ)");
   LOG_PRINTLN("  tHHmmSS     : set time and restart tick (local TZ)");
@@ -1362,6 +1384,7 @@ String generateStatusText(void) {
   getlocaltime();
   s += "Status:\n";
   s += "  Station : "; s += stationNames[currentStation]; s += "\n";
+  s += "  TX      : "; s += (txEnabled ? "enabled" : "disabled"); s += "\n";
   int chz = radiodiv * 500;
   s += "  Carrier : "; s += String(chz); s += " Hz ("; s += String((float)chz / 1000.0f, 1); s += " kHz)\n";
   s += "  Pin     : GPIO "; s += String(pinRadio); s += "\n";
@@ -1379,6 +1402,7 @@ String generateStatusText(void) {
   s += tbuf;
   s += "\nCommands:\n";
   s += "  h           : show this help\n";
+  s += "  e0|e1       : TX disable/enable (stop/start carrier + modulation)\n";
   s += "  y0|y1       : NTP sync off/on\n";
   s += "  dYYMMDD     : set date (interpreted in local TZ)\n";
   s += "  tHHmmSS     : set time and restart tick (local TZ)\n";
@@ -1557,6 +1581,7 @@ void applyDriveStrength(void) {
 void saveSettings(void) {
   prefs.begin("clocksync", false);
   prefs.putInt("station", currentStation);
+  prefs.putInt("tx", txEnabled);
   prefs.putInt("pin", pinRadio);
   prefs.putInt("ntp", ntpsync);
   prefs.putInt("buzz", buzzsw);
@@ -1573,6 +1598,10 @@ void loadSettings(void) {
   v = prefs.getInt("station", -1);
   if (v >= 0 && v <= SN_BPC) {
     currentStation = v;
+  }
+  v = prefs.getInt("tx", -1);
+  if (v == 0 || v == 1) {
+    txEnabled = v;
   }
   v = prefs.getInt("pin", -1);
   if (v >= 0 && isSafeAtomPin(v)) {
@@ -1616,9 +1645,10 @@ void applyDefaultSettings(void) {
     pinMode(pinRadio, OUTPUT);
     digitalWrite(pinRadio, LOW);
   }
-  driveStrength = GPIO_DRIVE_CAP_3;
+  driveStrength = GPIO_DRIVE_CAP_2;
   applyDriveStrength();
   // Defaults
+  txEnabled = 1;
   buzzsw = 1;
   dstOverride = 2;
   wwvbPendingOverride = 2;
