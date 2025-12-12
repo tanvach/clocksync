@@ -272,6 +272,8 @@ int tssec = 0;   // 0..(SSECDIV - 1)
 
 // Radio output GPIO (runtime configurable)
 volatile int pinRadio = PIN_RADIO;
+// GPIO drive strength (0=weakest..3=strongest)
+int driveStrength = GPIO_DRIVE_CAP_3;
 
 int currentStation = SN_DEFAULT;
 
@@ -365,6 +367,9 @@ void prepareWWVBMinuteBits(time_t minuteStartUTC);
   void saveSettings(void);
   void loadSettings(void);
   void applyDefaultSettings(void);
+// GPIO helpers
+int clampDriveCap(int cap);
+void applyDriveStrength(void);
 
 //...................................................................
 // intr handler:
@@ -406,8 +411,7 @@ void setup(void) {
   pinMode(PIN_MEAS, INPUT_PULLDOWN);
   pinMode(pinRadio, OUTPUT);
   digitalWrite(pinRadio, LOW);
-  // Max drive for stronger field with short wire antenna
-  gpio_set_drive_capability((gpio_num_t)pinRadio, GPIO_DRIVE_CAP_3);
+  applyDriveStrength();
   if (PIN_BUZZ >= 0) {
     pinMode(PIN_BUZZ, OUTPUT);
     digitalWrite(PIN_BUZZ, buzzout);
@@ -1203,10 +1207,22 @@ int docmd(char *buf) {
     pinRadio = newPin;
     pinMode(pinRadio, OUTPUT);
     digitalWrite(pinRadio, LOW);
-    // Max drive on the new pin as well
-    gpio_set_drive_capability((gpio_num_t)pinRadio, GPIO_DRIVE_CAP_3);
+    applyDriveStrength();
     starttimer();
     LOG_PRINTF("radio pin set to %d\n", pinRadio);
+    saveSettings();
+    return 1;
+  } else if (buf[0] == 'g' || buf[0] == 'G') {  // set GPIO drive strength 0..3
+    if (strlen(buf) != 2) {
+      return 0;
+    }
+    int level = buf[1] - '0';
+    if (level < GPIO_DRIVE_CAP_0 || level > GPIO_DRIVE_CAP_3) {
+      return 0;
+    }
+    driveStrength = clampDriveCap(level);
+    applyDriveStrength();
+    LOG_PRINTF("GPIO drive strength set to %d (0=weakest,3=strongest)\n", driveStrength);
     saveSettings();
     return 1;
   } else if (buf[0] == 'y' || buf[0] == 'Y') {  // NTP sync
@@ -1311,6 +1327,7 @@ void printhelp(void) {
   int carrierHz = radiodiv * 500;  // radiodiv is double-freq in kHz
   LOG_PRINTF("  Carrier : %d Hz (%.1f kHz)\n", carrierHz, (float)carrierHz / 1000.0);
   LOG_PRINTF("  Pin     : GPIO %d\n", pinRadio);
+  LOG_PRINTF("  Drive   : %d (0=weak, 3=strong)\n", driveStrength);
   LOG_PRINTF("  NTP     : %s\n", ntpsync ? "on" : "off");
   LOG_PRINTF("  TZ      : %s\n", TZ);
   LOG_PRINTF("  Buzzer  : %s\n", buzzsw ? "on" : "off");
@@ -1325,10 +1342,11 @@ void printhelp(void) {
   LOG_PRINTLN("  z0|z1       : buzzer off/on");
   LOG_PRINTLN("  l0|l1       : LED off/on");
   LOG_PRINTLN("  pNN         : set radio output pin (e.g., p25)");
+  LOG_PRINTLN("  g0|g1|g2|g3 : set GPIO drive (0=weakest,3=strongest)");
   LOG_PRINTLN("  f           : self-test: jumper radio pin to GPIO33, measure carrier");
-  LOG_PRINTLN("  n0|n1       : (WWVB) compatibility only; no effect here (framing matches txtempus)");
+  LOG_PRINTLN("  n0|n1       : (WWVB) legacy framing toggle — ignored; always txtempus framing");
   LOG_PRINTLN("  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB ignores)");
-  LOG_PRINTLN("  q0|q1|q2    : (WWVB) compatibility only; no effect here (framing matches txtempus)");
+  LOG_PRINTLN("  q0|q1|q2    : (WWVB) legacy \"pending\" toggle — ignored; always txtempus framing");
   LOG_PRINTLN("  sX          : set station to X (one of):");
   for (int i = 0; i < 7; i++) {
     LOG_PRINTF("    s%c : %s\n", stationCmds[i], stationNames[i]);
@@ -1347,6 +1365,7 @@ String generateStatusText(void) {
   int chz = radiodiv * 500;
   s += "  Carrier : "; s += String(chz); s += " Hz ("; s += String((float)chz / 1000.0f, 1); s += " kHz)\n";
   s += "  Pin     : GPIO "; s += String(pinRadio); s += "\n";
+  s += "  Drive   : "; s += String(driveStrength); s += " (0=weak,3=strong)\n";
   s += "  NTP     : "; s += (ntpsync ? "on" : "off"); s += "\n";
   s += "  TZ      : "; s += TZ; s += "\n";
   s += "  Buzzer  : "; s += (buzzsw ? "on" : "off"); s += "\n";
@@ -1366,10 +1385,11 @@ String generateStatusText(void) {
   s += "  z0|z1       : buzzer off/on\n";
   s += "  l0|l1       : LED off/on\n";
   s += "  pNN         : set radio output pin (e.g., p25)\n";
+  s += "  g0|g1|g2|g3 : set GPIO drive (0=weakest,3=strongest)\n";
   s += "  f           : self-test: jumper radio pin to GPIO33, measure carrier\n";
-  s += "  n0|n1       : (WWVB) compatibility only; no effect here (framing matches txtempus)\n";
+  s += "  n0|n1       : (WWVB) legacy framing toggle — ignored; always txtempus framing\n";
   s += "  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB ignores)\n";
-  s += "  q0|q1|q2    : (WWVB) compatibility only; no effect here (framing matches txtempus)\n";
+  s += "  q0|q1|q2    : (WWVB) legacy \"pending\" toggle — ignored; always txtempus framing\n";
   s += "  sX          : set station to X (one of):\n";
   for (int i = 0; i < 7; i++) {
     s += "    s"; s += stationCmds[i]; s += " : "; s += stationNames[i]; s += "\n";
@@ -1411,16 +1431,19 @@ void handleCmd(void) {
 
 void handleRoot(void) {
   String s;
-  s.reserve(1024);
+  s.reserve(1400);
   s += "<!doctype html><meta charset=\"utf-8\"><title>"; s += DEVICENAME; s += "</title>";
-  s += "<style>body{font-family:monospace;white-space:pre-wrap;margin:16px;}input,button{font-family:monospace;}#msg{margin-left:8px;color:#080}</style>";
+  s += "<style>body{font-family:monospace;white-space:pre-wrap;margin:16px;}input,button,select{font-family:monospace;}#msg,#drvmsg{margin-left:8px;color:#080}</style>";
   s += "<h3>"; s += DEVICENAME; s += "</h3>";
   s += "<div><form id=\"cmdform\">cmd: <input id=\"cmd\" name=\"c\" size=\"20\" autocomplete=\"off\"><button type=\"submit\">Send</button><span id=\"msg\"></span></form></div>";
+  s += "<div style=\"margin-top:8px;\">GPIO drive (0=weak..3=strong): <select id=\"drive\"><option value=\"0\">0 (weakest)</option><option value=\"1\">1</option><option value=\"2\">2</option><option value=\"3\">3 (strongest)</option></select> <button id=\"setDrive\" type=\"button\">Apply</button><span id=\"drvmsg\"></span></div>";
   s += "<hr><div><a href=\"/status.txt\" target=\"_blank\">status.txt</a></div><pre id=\"status\">";
   s += generateStatusText();
   s += "</pre><script>(function(){\n";
   s += "function fetchStatus(){return fetch('/status.txt',{cache:'no-store'}).then(r=>r.text()).then(t=>{document.getElementById('status').textContent=t;});}\n";
   s += "document.getElementById('cmdform').addEventListener('submit',function(ev){ev.preventDefault();var i=document.getElementById('cmd');var m=document.getElementById('msg');m.textContent='';var v=i.value.trim();if(!v){return;}fetch('/cmd?c='+encodeURIComponent(v)).then(r=>r.text()).then(t=>{m.style.color=(t.indexOf('OK')===0)?'#080':'#a00';m.textContent=t.trim();i.select();return fetchStatus();}).catch(()=>{m.style.color='#a00';m.textContent='ERR';});});\n";
+  s += "var driveSel=document.getElementById('drive');driveSel.value='"; s += driveStrength; s += "';\n";
+  s += "document.getElementById('setDrive').addEventListener('click',function(ev){ev.preventDefault();var dmsg=document.getElementById('drvmsg');dmsg.textContent='';fetch('/cmd?c=g'+encodeURIComponent(driveSel.value)).then(r=>r.text()).then(t=>{var ok=(t.indexOf('OK')===0);dmsg.style.color=ok?'#080':'#a00';dmsg.textContent=ok?'updated':'ERR';return ok?fetchStatus():null;}).catch(()=>{dmsg.style.color='#a00';dmsg.textContent='ERR';});});\n";
   // No periodic refresh to minimize WiFi usage
   s += "})();</script>";
   server.send(200, "text/html", s);
@@ -1519,6 +1542,17 @@ int isSafeAtomPin(int p) {
   return 0;
 }
 
+int clampDriveCap(int cap) {
+  if (cap < (int)GPIO_DRIVE_CAP_0) return GPIO_DRIVE_CAP_0;
+  if (cap > (int)GPIO_DRIVE_CAP_3) return GPIO_DRIVE_CAP_3;
+  return cap;
+}
+
+void applyDriveStrength(void) {
+  driveStrength = clampDriveCap(driveStrength);
+  gpio_set_drive_capability((gpio_num_t)pinRadio, (gpio_drive_cap_t)driveStrength);
+}
+
 // ------------------------- Persistence (Preferences) -------------------------
 void saveSettings(void) {
   prefs.begin("clocksync", false);
@@ -1529,6 +1563,7 @@ void saveSettings(void) {
   prefs.putInt("dst", dstOverride);
   prefs.putInt("wwvbPend", wwvbPendingOverride);
   prefs.putInt("led", ledEnabled);
+  prefs.putInt("drive", driveStrength);
   prefs.end();
 }
 
@@ -1563,6 +1598,10 @@ void loadSettings(void) {
   if (v == 0 || v == 1) {
     ledEnabled = v;
   }
+  v = prefs.getInt("drive", -1);
+  if (v >= GPIO_DRIVE_CAP_0 && v <= GPIO_DRIVE_CAP_3) {
+    driveStrength = v;
+  }
   prefs.end();
 }
 
@@ -1576,8 +1615,9 @@ void applyDefaultSettings(void) {
     pinRadio = defaultPin;
     pinMode(pinRadio, OUTPUT);
     digitalWrite(pinRadio, LOW);
-    gpio_set_drive_capability((gpio_num_t)pinRadio, GPIO_DRIVE_CAP_3);
   }
+  driveStrength = GPIO_DRIVE_CAP_3;
+  applyDriveStrength();
   // Defaults
   buzzsw = 1;
   dstOverride = 2;

@@ -16,6 +16,7 @@ The original copyright notice remains in the source file header.
 - Updated default pins/hardware notes (e.g., M5 Atom Lite) and cleaned comments.
 - Added `.gitignore` for common Arduino/PlatformIO artifacts and `secrets.h`.
 - Aligned WWVB minute framing and DST bit semantics with the proven reference implementation `txtempus` for predictability.
+- Added GPIO drive-strength control (0-3) with web UI + persistence for safer antenna drive.
 
 ## WiFi credentials (secrets)
 
