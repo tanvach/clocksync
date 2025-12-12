@@ -185,7 +185,7 @@ tHHmmSS      set time (local TZ)
 z0|z1        buzzer off/on
 l0|l1        LED off/on
 pNN          set radio GPIO (e.g., p25)
-f            frequency self-test (jumper radio to meas pin)
+f            frequency self-test (jumper radio to meas pin; default meas pin GPIO33)
 n0|n1        WWVB next-minute (compat only; no effect)
 q0|q1|q2     WWVB pending (compat only; no effect)
 x0|x1|x2     DST STD/DST/AUTO (applies to DCF/MSF)

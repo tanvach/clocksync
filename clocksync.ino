@@ -27,13 +27,16 @@
 
 //...................................................................
 // hardware config
+// Radio output pin (default 25). Grove pins 26 or 32 also work if you prefer using the Grove port;
+// avoid them if you need I2C on SDA/SCL. Stay within isSafeAtomPin().
 #define PIN_RADIO (25)
+// note: {pin -> 330ohm -> 30cm loop antenna -> GND} works
+//     (33mW, but detuned length (super shorten), only very weak radiowave emitted).
 #define PIN_BUZZ (-1)   // no onboard buzzer on M5 Atom Lite
 #define PIN_LED (-1)    // use M5 Atom RGB LED instead
 // Optional measurement input (jumper to radio pin for self-test)
+// Default: GPIO33.
 #define PIN_MEAS (33)
-// note: {pin23 -> 330ohm -> 30cm loop antenna -> GND} works
-//     (33mW, but detuned length (super shorten), only very weak radiowave emitted).
 
 #include <WiFi.h>
 #include <ESPmDNS.h>
