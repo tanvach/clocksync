@@ -8,11 +8,11 @@
 // This is a fork with improvements and enhancements; see README for details.
 //
 // 2021. 10. 28-29: ver. 0.1: worked on JJY 40KHz
-// 2021. 10. 30: ver 0.2: added Bluetooth command
 // 2021. 10. 30-11. 2: ver 1.0: added codes for WWVB/DCF77/HBG/MSF/BPC
 //   => removed HBG, added BSF, checked WWVB/DCF77/MSF by world radio clock.
 //   * DCF77, MSF forwards 1 minute.
 // 2022.  1. 21: ver 1.1: added NTP feature
+// 2025. 12. 30: ver 1.2: added button TX toggle & OTA support
 //
 // JJY (Japan): https://ja.wikipedia.org/wiki/JJY
 // WWVB (US): https://en.wikipedia.org/wiki/WWVB
@@ -37,10 +37,13 @@
 // Optional measurement input (jumper to radio pin for self-test)
 // Default: GPIO33.
 #define PIN_MEAS (33)
+// Optional button pin (default 39 for M5 Atom Lite)
+#define PIN_BUTTON (39)
 
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 // M5 Atom Lite support (RGB LED, button, etc.)
 #include <M5Atom.h>
 // Drive strength configuration for safe antenna drive
@@ -300,6 +303,9 @@ Preferences prefs;
 String lastCmdResp;
 int ledEnabled = 1;                // 0=off, 1=on (M5 LED or PIN_LED)
 static int lastLedState = -1;      // -1 unknown, 0 off, 1 on, -2 disabled
+bool otaUpdating = false;          // Guard to pause loop during OTA
+
+// LEDC carrier generation (single output pin)
 
 // LEDC carrier generation (single output pin)
 static const ledc_mode_t LEDC_MODE = LEDC_LOW_SPEED_MODE;
@@ -327,6 +333,7 @@ void setup(void);
 void loop(void);
 void starttimer(void);
 void stoptimer(void);
+void setTxState(int enable);
 void ampchange(void);
 void setstation(int station);
 void binarize(int v, int pos, int len);
@@ -369,6 +376,7 @@ void prepareWWVBMinuteBits(time_t minuteStartUTC);
   void saveSettings(void);
   void loadSettings(void);
   void applyDefaultSettings(void);
+  void setupOTA(void);
 // GPIO helpers
 int clampDriveCap(int cap);
 void applyDriveStrength(void);
@@ -400,13 +408,15 @@ void setup(void) {
 
   LOG_PRINTLN("\nUSB serial control ready (115200 bps). Type 'h' + Enter for help.");
 
-  // Bluetooth removed; HTTP server provides control/status.
+  // HTTP server provides control/status.
 
   // Load persisted settings before initializing subsystems
   loadSettings();
   if (ntpsync) {
     ntpstart();
   }
+  // Safe to init OTA if WiFi connected (Starts mDNS)
+  setupOTA();
   // Start HTTP control/status server
   setupWebServer();
   // Prepare radio pin
@@ -451,8 +461,22 @@ void loop() {
   static char usb[128];
   static int usbp = 0;
 
+  // Urgent: Handle OTA first and skip everything else if updating
+  ArduinoOTA.handle();
+  if (otaUpdating) {
+    yield(); // Let WiFi stack flow (more responsive than delay)
+    return;
+  }
+
   // Update M5 state (button, etc.)
   M5.update();
+  if (M5.Btn.wasPressed()) {
+    setTxState(!txEnabled);
+    saveSettings();
+    LOG_PRINTF("Button: TX %s\n", txEnabled ? "enabled" : "disabled");
+  }
+  // For generic ESP32 (if M5Atom lib excluded):
+  // if (digitalRead(PIN_BUTTON) == LOW) { delay(50); if(digitalRead(PIN_BUTTON)==LOW) { ... } }
 
   // Aligned second boundary
   if (secBoundaryFlag) {
@@ -530,8 +554,7 @@ void loop() {
     }
     Serial.print(ampmod ? "~" : ".");
   }
-
-  // Bluetooth removed; commands accepted via USB serial and HTTP
+  // Commands accepted via USB serial and HTTP
   while (Serial.available()) {
     usb[usbp] = Serial.read();
     if (usb[usbp] == '\n' || usb[usbp] == '\r' || usbp == sizeof(usb) - 1) {
@@ -546,6 +569,9 @@ void loop() {
   server.handleClient();
   delay(1);  // feed watchdog
 }
+
+
+//...................................................................
 
 
 //...................................................................
@@ -578,6 +604,25 @@ void stoptimer(void) {
 void ampchange(void) {
   // handled in loop() by LEDC amplitude update
   return;
+}
+
+void setTxState(int enable) {
+  if (enable) {
+    txEnabled = 1;
+    starttimer();
+  } else {
+    txEnabled = 0;
+    stoptimer();
+    // Force LED off
+    if (ledEnabled) {
+      if (PIN_LED >= 0) {
+        digitalWrite(PIN_LED, LOW);
+      } else {
+        M5.dis.drawpix(0, 0x000000);
+      }
+      lastLedState = 0;
+    }
+  }
 }
 
 
@@ -1220,12 +1265,10 @@ int docmd(char *buf) {
     return 1;
   } else if (buf[0] == 'e' || buf[0] == 'E') {  // TX enable/disable
     if (buf[1] == '0') {
-      txEnabled = 0;
-      stoptimer();
+      setTxState(0);
       lastCmdResp = String("TX disabled\n");
     } else if (buf[1] == '1') {
-      txEnabled = 1;
-      starttimer();
+      setTxState(1);
       lastCmdResp = String("TX enabled\n");
     } else {
       return 0;
@@ -1480,15 +1523,55 @@ void setupWebServer(void) {
   server.onNotFound([](){ server.send(404, "text/plain", "not found\n"); });
   server.begin();
   if (WiFi.status() == WL_CONNECTED) {
-    if (MDNS.begin(DEVICENAME)) {
-      MDNS.addService("http", "tcp", 80);
-      LOG_PRINTF("HTTP server: http://%s.local/\n", DEVICENAME);
-    } else {
-      LOG_PRINTLN("mDNS start failed");
-    }
+    // Note: MDNS.begin(DEVICENAME) is called by ArduinoOTA.begin() in setupOTA().
+    // We just need to add the service here.
+    MDNS.addService("http", "tcp", 80);
+    LOG_PRINTF("HTTP server: http://%s.local/\n", DEVICENAME);
   } else {
     LOG_PRINTLN("HTTP server started (WiFi not connected yet)");
   }
+}
+
+void setupOTA(void) {
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_PRINTLN("OTA init skipped (no WiFi)");
+    return;
+  }
+  // Ensure max performance for OTA (disable power save)
+  WiFi.setSleep(false);
+  ArduinoOTA.setHostname(DEVICENAME);
+  ArduinoOTA.setPassword("clocksync");
+  ArduinoOTA.onStart([]() {
+    // Enter safe mode: stop timers and block loop
+    otaUpdating = true;
+    stoptimer();
+    // Note: Do not touch M5/LED here or do complex things that might crash
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+    LOG_PRINTLN("Start updating " + type);
+  });
+  ArduinoOTA.onEnd([]() {
+    otaUpdating = false;
+    LOG_PRINTLN("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    // printf is safe here (not in interrupt context)
+    // Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) LOG_PRINTLN("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) LOG_PRINTLN("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) LOG_PRINTLN("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) LOG_PRINTLN("Receive Failed");
+    else if (error == OTA_END_ERROR) LOG_PRINTLN("End Failed");
+  });
+  ArduinoOTA.begin();
+  LOG_PRINTLN("OTA Ready");
 }
 
 

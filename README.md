@@ -1,4 +1,4 @@
-# clocksync (fork of nisejjy)
+# clocksync (v1.2) - fork of nisejjy
 
 ESP32 fake radio clock station. This repository is a maintained fork of the original `nisejjy` project by SASAKI Taroh.
 
@@ -68,7 +68,8 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 ### M5 Atom Lite (default)
 - Install the M5Atom library (Arduino Library Manager: "M5Atom").
 - Default wiring: connect a small loop antenna (e.g., ~30 cm wire) from `GPIO32` to GND via ~330 Ω.
-- The on-device RGB LED shows activity; the built-in button is not used.
+- The on-device RGB LED shows activity.
+- The built-in button (or button on GPIO 39) toggles the radio signal (TX on/off).
 
 ### Generic ESP32 (e.g., DevKit v1/WROOM)
 1) Libraries
@@ -80,6 +81,7 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
      - Classic ESP32 input-only: `GPIO34..GPIO39` (don’t use for `PIN_RADIO`).
      - Boot/strap-sensitive: `GPIO0`, `GPIO2`, `GPIO12`, `GPIO15`.
    - Optional buzzer: set `#define PIN_BUZZ` to a valid GPIO or `-1` to disable (default off).
+   - Optional button: connect a button between `PIN_BUTTON` (default 39) and GND to toggle TX. If you are not using M5Atom library, you may need to implement the button read logic in `loop()`.
 3) Wiring
    - Connect a small loop antenna from `PIN_RADIO` to GND via ~330 Ω resistor (very low-power magnetic coupling). Observe local RF regulations.
 4) Build/Flash
@@ -101,12 +103,37 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 - [ ] Install M5Atom library or comment out `M5.` calls.
 - [ ] Optionally set `PIN_BUZZ` or keep `-1`.
 - [ ] Configure `TZ` in `clocksync.ino` per your station.
-- [ ] Wire loop antenna with ~330 Ω to GND. Verify with `f` command.
+- [ ] **Wiring**: Connect an antenna from `PIN_RADIO` to GND via ~330 Ω resistor.
+    - **Recommended**: Use a **ferrite core antenna** tuned to your target frequency (see below).
+    - **Easy Way**: Buy a radio time receiver module (Amazon/eBay), desolder the ferrite antenna, and wire it to your ESP32.
+    - **Simple**: A long loop of wire (~30cm) works for very close range testing.
+
+## Frequencies
+- **40 kHz**: JJY (Fukushima)
+- **60 kHz**: JJY (Fukuoka), WWVB (US), MSF (UK)
+- **68.5 kHz**: BPC (China)
+- **77.5 kHz**: DCF77 (Germany), BSF (Taiwan)
+
 
 ## Protocol reference and compatibility notes
 
 - The data stream (minute frame layout and amplitude patterns) is based on and cross-checked with `txtempus`, a well-known Raspberry Pi/JETSON transmitter reference implementation. See: [hzeller/txtempus](https://github.com/hzeller/txtempus).
 - When this project mentions “txtempus framing” or “txtempus defaults” in logs/help, it means the on-air bit layout matches `txtempus`’s interpretation of the respective time service. Legacy toggles such as WWVB next-minute or pending overrides are accepted for compatibility but have no effect here; clocksync always encodes WWVB per the standard frame (UTC time-base; DST-now/tomorrow bits set automatically).
+    
+## OTA Updates
+
+This firmware supports Over-The-Air (OTA) updates via the Arduino IDE/PlatformIO.
+
+1.  **First Flash**: Must be done via USB to install the OTA-capable firmware.
+2.  **Network Port**: Once connected to WiFi, the device will appear as a network port named `clocksync` (or your configured `DEVICENAME`) in the Arduino IDE "Port" menu.
+3.  **Upload**: Select the network port and click Upload.
+    -   **Password**: If asked, enter `clocksync`.
+    -   The device will receive the new firmware and reboot.
+
+> [!NOTE]
+> OTA is only enabled if the device successfully connects to WiFi on boot.
+>
+> **Important**: The Serial Monitor is **not available** over the network port. To view logs or debugging information, you must connect the device via USB.
 
 ## Home Assistant scheduling (optional)
 
@@ -119,6 +146,7 @@ Prereqs:
 ### TX enable/disable command
 
 This fork adds a TX enable/disable command:
+- Button press: toggle TX on/off
 - `e1`: enable TX (start carrier + modulation scheduler)
 - `e0`: disable TX (stop carrier + modulation scheduler)
 
