@@ -43,8 +43,12 @@ This project is a maintained fork of the original `nisejjy` project by SASAKI Ta
 2.  **Ground**: Connect the other end of the antenna to a **Current Limiting Resistor** (220Ω - 330Ω), and then to `GND`.
     *   *Why a resistor?* It protects your ESP32 from drawing too much current, as the antenna coil has very low resistance.
 3.  **Antenna Types**:
-    *   **Ferrite Rod (Recommended)**: Scavenge one from an old radio clock or buy a "60kHz ferrite antenna". Best range.
-    *   **Wire Loop**: A simple coil of wire (e.g., 30 turns of magnet wire around a water bottle). Short range, but works.
+    *   **Ferrite Rod (Recommended)**: Scavenge one from an old radio clock or buy a ferrite antenna tuned to your target frequency. **Important**: You must match the frequency! (Tested range > 1m)
+        *   **60 kHz**: For WWVB (USA), MSF (UK), JJY (Japan).
+        *   **40 kHz**: For JJY (Japan).
+        *   **77.5 kHz**: For DCF77 (Germany), BSF (Taiwan).
+        *   **68.5 kHz**: For BPC (China).
+    *   **Wire Loop**: A simple coil of wire (e.g., 30 turns of magnet wire around a water bottle). Short range, but works for any frequency.
 4.  **Placement**: Place your target watch/clock **inside** or **immediately next to** the antenna coil. This is a low-power near-field emulator; range is typically < 10cm.
 
 ### 2. Software Configuration
