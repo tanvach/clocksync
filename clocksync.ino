@@ -1,29 +1,13 @@
 //
-// nisejjy - fake JJY (standarad time radio broadcast) station
-//     using software radio on ESP32.
+// clocksync.ino - ESP32 fake radio clock station
 //
-// (c) 2021 by taroh (sasaki.taroh@gmail.com)
+// Forked from 'nisejjy' by SASAKI Taroh (tarohs).
+// Maintained by Tanvach.
 //
-// Forked as 'clocksync' and maintained by Tanvach (2025).
-// This is a fork with improvements and enhancements; see README for details.
+// See README.md for usage, hardware setup, and attribution.
+// See HOW_IT_WORKS.md for technical details on signal encoding.
 //
-// 2021. 10. 28-29: ver. 0.1: worked on JJY 40KHz
-// 2021. 10. 30-11. 2: ver 1.0: added codes for WWVB/DCF77/HBG/MSF/BPC
-//   => removed HBG, added BSF, checked WWVB/DCF77/MSF by world radio clock.
-//   * DCF77, MSF forwards 1 minute.
-// 2022.  1. 21: ver 1.1: added NTP feature
-// 2025. 12. 30: ver 1.2: added button TX toggle & OTA support
-//
-// JJY (Japan): https://ja.wikipedia.org/wiki/JJY
-// WWVB (US): https://en.wikipedia.org/wiki/WWVB
-//            *set UT for WWVB.
-// DCF77 (Germany) : https://www.eecis.udel.edu/~mills/ntp/dcf77.html
-// (HBG (Switzerland) discon: https://msys.ch/decoding-time-signal-stations )
-// BSF (Taiwan): https://en.wikipedia.org/wiki/BSF_(time_service)
-// MSF (UK): https://en.wikipedia.org/wiki/Time_from_NPL_(MSF)
-// BPC (China): https://harmonyos.51cto.com/posts/1731
-//
-// note: BSF, BPC codes are not certified.
+
 
 //...................................................................
 // hardware config
@@ -1091,61 +1075,15 @@ int qparity(int pos, int len) {
 }
 
 
-//// calculate doy (day of year)/dow (day of week) from YY/MM/DD
-//void
-//setdoydow(void)
-//{
-//  int j0 = julian(tyear, 1, 1);      // new year day of this year
-//  int j1 = julian(tyear, tmon, tday);
-//  tdoy = j1 - j0 + 1; // 1..365/366
-//  tdow = j1 % 7;      // 0..6
-//  return;
-//}
-//
-//// return julian date (? relative date from a day)
-//// sunday is multiple of 7
-//int
-//julian(int y, int m, int d)
-//{
-//  if (m <= 2) {
-//    m = m + 12;
-//    y--;
-//  }
-//  return y * 1461 / 4 + (m + 1) * 153 / 5 + d + 6;
-////  1461 / 4 == 365.25, 153 / 5 == 30.6
-//}
-//
-//// increment tday-tmon-tyear, tdoy, tdow
-//void
-//incday(void)
-//{
-//  int year1 = tyear;   // year of next month
-//  int mon1 = tmon + 1; // next month
-//  if (12 < mon1) {
-//    mon1 = 1;
-//    year1++;
-//  }
-//  int day1 = tday + 1; // date# of tomorrow
-//  if (julian(year1, mon1, 1) - julian(tyear, tmon, 1) < day1) {
-//    tday = 1;  // date# exceeds # of date in this month
-//    tmon = mon1;
-//    tyear = year1;
-//  } else {
-//    tday = day1;
-//  }
-//  setdoydow(); // tdoy, tdow is updated from tyear-tmonth-tday
-//  return;
-//}
+
 
 //...................................................................
-// Bluetooth command
+// Command handler
 //
-// y[01]: NTP sync off/on
-//   to force set the current date/time (d/t), first turn off NTP sync.
-// dYYMMDD: set date to YY/MM/DD
-// tHHmmSS: set time to HH:mm:SS
-// z[01]: buzzer off/on
-// s[jkwdhmb]: set station to JJY_E, JJY_W, WWVB, DCF77, HBG, MSF, BPC
+// Processes commands from Serial (USB) and HTTP.
+// See README.md for the full command reference.
+//
+
 
 int docmd(char *buf) {
   int arg1, arg2;

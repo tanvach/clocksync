@@ -1,218 +1,242 @@
-## clocksync: How it Works
+# Technical Reference: Signal Encodings & Architecture
 
-An ESP32 pretends to be a low‑frequency time station. It generates a carrier at 40/60/68.5/77.5 kHz and wiggles the amplitude so your radio‑controlled clocks think they’re listening to JJY, WWVB, DCF77, MSF, BSF, or BPC. This document explains the common architecture and the nitty‑gritty differences between station protocols.
+This document details the low-level signal generation techniques and station protocol specifications used by `clocksync`. It is designed to provide sufficient detail for a skilled engineer to reimplement the logic on another platform.
 
-Fun fact: despite the mystique, these systems are glorified minute‑long barcodes sent at 1 symbol per second.
+## Architecture
 
-### What all stations have in common
+### Carrier Generation
+The ESP32 generates the Low Frequency (LF) carrier using the `LEDC` (LED Control) peripheral.
+*   **Peripheral**: `LEDC_TIMER_0`, `LEDC_CHANNEL_0`.
+*   **Frequency**: 40 kHz, 60 kHz, 68.5 kHz, or 77.5 kHz (depending on station).
+*   **Resolution**: 8-bit duty resolution.
 
-- **Carrier generation**: One ESP32 `LEDC` channel generates the carrier. Amplitude modulation is done by toggling between two PWM duty levels:
-  - High power ≈ 50% duty; Low power ≈ 5–6% duty (approximate “reduced carrier”).
-- **Timing**: A high‑resolution `esp_timer` aligns to wall‑clock second boundaries, then ticks every 100 ms. Each second is 10 sub‑slots of 100 ms.
-- **Amplitude schedule**: At every 100 ms tick, the sketch selects High or Low according to the current station’s symbol pattern for that second.
-- **Minute framing**: All services use a 60‑second frame with a special “marker” second and data seconds encoding BCD or quaternary digits.
-- **Time source**: NTP sets the ESP32’s RTC using a POSIX `TZ` string. The modulation uses the local time (`nowtm`) for most stations; WWVB uses UTC for numerical fields (details below).
-- **Control/Status**:
-  - USB Serial at 115200 for commands and debug.
-  - Optional web UI (mDNS `http://clocksync.local/`) with a simple status page and a `GET /cmd?c=...` command endpoint.
+### Amplitude Modulation (AM)
+The system simulates AM by dynamically adjusting the PWM duty cycle of the carrier.
+*   **High Power (P_high)**: Duty cycle `128/255` (~50%). This represents the maximum fundamental frequency component (square wave).
+*   **Low Power (P_low)**: Duty cycle `14/255` (~5.5%). This effectively attenuates the radiated power to simulate the "dipped" carrier state.
+*   **Note**: This is not true analog AM, but "PWM-based attenuation". It works effectively for near-field magnetic coupling because the receiver's AGC treats the reduced duty cycle as a lower signal strength.
 
-### The on‑air second (symbol) shapes
+### Precise Timing
+To ensure robust signal decoding by clocks, symbol timing must be precise and drift-free.
+1.  **Alignment**: An `esp_timer` ("align_timer") fires exactly at the next wall-clock second boundary (calculated via `gettimeofday` and microsecond offsets).
+2.  **Tick Loop**: Once aligned, the `tick_timer` runs periodically every **100 ms**.
+3.  **Jitter-Free**: By using hardware timers instead of `delay()` in the main loop, we avoid modulation jitter caused by WiFi activity or web server processing.
 
-Each second is encoded by how long the carrier is reduced (Low) within that second. Diagrams below show 10 ticks of 100 ms from left (0.0 s) to right (1.0 s).
+---
 
-Legend: `#` = High (normal carrier), `.` = Low (reduced carrier)
+## WWVB Implementation Logic: `txtempus` vs. `nisejjy`
 
-```text
-WWVB (start‑Low, classic):
-  0-bit    ..########      (Low 0.2 s, then High 0.8 s)
-  1-bit    .....#####      (Low 0.5 s, then High 0.5 s)
-  Marker   ........##      (Low 0.8 s, then High 0.2 s)
+This project explicitly follows the logic of the reference implementation **[txtempus]** (by Henner Zeller) for WWVB, deviating from the original **nisejjy** logic.
 
-DCF77 (start‑Low):
-  0-bit    .#########      (Low 0.1 s, then High 0.9 s)
-  1-bit    ..########      (Low 0.2 s, then High 0.8 s)
-  Marker   ##########      (Special: full‑second High; frame ends with missing 59th second)
+### The Problem (`nisejjy` legacy)
+The original `nisejjy` implementation (and many simple Arduino emulators) often attempted to encode **Local Time** into the WWVB frame.
+*   **Issue**: WWVB is defined to broadcast **UTC** (Coordinated Universal Time). The receiver logic (the clock itself) handles the Timezone and DST offsets.
+*   **Symptom**: Clocks would receive "Local Time" disguised as UTC, then apply *another* offset, resulting in the display being wrong by (GMT Offset + DST).
 
-MSF (start‑Low, 4 symbols; parity uses special variants):
-  0-bit    .#########      (0.1 s Low)
-  1-bit    ..########      (0.2 s Low)
-  M-bit    .....#####      (0.5 s Low)  [minute marker]
-  P0/P1    ...#######      (parity seconds use distinct shapes; see MSF section)
+### The Solution (`txtempus` / `clocksync`)
+`clocksync` adopts the `txtempus` philosophy:
+1.  **UTC Base**: The framing bits (Minute, Hour, Day, Year) are populated using `gmtime()` (UTC).
+2.  **DST Flags**: DST status (Bit 57 "DST Tomorrow" and Bit 58 "DST Now") is calculated independently based on US DST rules, but applied to the UTC frame.
+3.  **Result**: The signal is indistinguishable from the real WWVB station. Your clock behaves exactly as it would with a real signal (correctly applying your local timezone settings).
 
-JJY (end‑Low in this sketch):
-  0-bit    ########..      (High 0.8 s, Low 0.2 s)
-  1-bit    #####.....      (High 0.5 s, Low 0.5 s)
-  Marker   ##........      (High 0.2 s, Low 0.8 s)
+> **Reference**: [github.com/hzeller/txtempus](https://github.com/hzeller/txtempus)
 
-BSF/BPC (quaternary, start‑Low with 4 symbols + marker): patterns map 2‑bit values to distinct Low durations.
-```
+---
 
-Note: JJY here uses end‑Low shapes (Low at the tail of the second), which many clocks still accept since integration windows vary. DCF77/WWVB/MSF use start‑Low shapes as per common practice.
+## Data Encoding Schemes
 
-## Protocols by station
+The stations use different methods to encode values (Time, Date) into bits.
 
-Below, bit/field positions refer to the minute frame defined in the code; unless noted, bit 0 is the first second of the minute. “Marker” seconds appear regularly to delimit fields.
+### 1. BCD (Binary-Coded Decimal)
+Most stations (WWVB, JJY, DCF77, MSF) use BCD. Each decimal digit is transmitted separately as a 4-bit binary sequence.
+*   *Example*: Minute `42` is sent as:
+    *   Tens place `4` -> `0100`
+    *   Ones place `2` -> `0010`
+*   This makes it easy for simple logic circuits (like 1970s hardware clocks) to decode directly to a 7-segment display digit.
 
-### JJY (Japan)
+### 2. Binary
+Some fields (like "Year" in BPC or "DOW" in DCF77) use straight binary encoding for the entire value, rather than splitting by digits.
 
-- **Frequencies**: `JJY_E` 40 kHz (Fukushima), `JJY_W` 60 kHz (Fukuoka)
-- **Symbol shapes**: end‑Low (see above)
-- **Frame layout (60 seconds)**, markers at seconds 0, 9, 19, 29, 39, 49, 59.
+### 3. Quaternary (Base-4)
+Used by **BPC** and **BSF**.
+*   Instead of sending 0 or 1 per second, these stations send one of **4 symbols** per second.
+*   This literally doubles the data rate (2 bits per second).
+*   **Signaling**: The pulse width determines the value:
+    *   `00` = 0.1s width
+    *   `01` = 0.2s width
+    *   `10` = 0.3s width
+    *   `11` = 0.4s width
+### 4. Pulse Width Encoding (PWM / Shifts)
+Used by **WWVB**, **DCF77**, **MSF**, and **JJY**.
+*   This is the physical layer encoding: how a single "bit" (0, 1, or Marker) is physically signaled on the carrier.
+*   **Concept**: We drop the carrier power (to "Low") for a specific duration *within* the 1-second window.
+*   **Start-Low** (WWVB, DCF77, MSF): The second *starts* with reduced power. The duration of this "Low" state defines the symbol.
+    *   *Short Low* (e.g., 0.2s) = Binary 0
+    *   *Long Low* (e.g., 0.5s) = Binary 1
+    *   *Very Long Low* (e.g., 0.8s) = Marker
+*   **End-Low** (JJY): The second starts High and ends with a "Low" pulse. The logic is inverted or shifted, but the principle of "duration = value" remains the same.
 
-```text
-Secs  0.. 9 : (M), MIN10[3], 0, MIN1[4], (M)
-     10..19 : 0, 0, HOUR10[2], 0, HOUR1[4], (M)
-     20..29 : 0, 0, DOY100[2], DOY10[4], (M)
-     30..39 : DOY1[4], 0, 0, PA1, PA2, 0, (M)
-     40..49 : 0, YEAR[8], (M)
-     50..59 : DOW[3], LS1, LS2, 0, 0, 0, 0, (M)
-```
+---
 
-- **Parity**: `PA1 = parity(12..18)` minutes/hours; `PA2 = parity(1..8)` minutes.
-- **Leap seconds**: `LS1/LS2` fields present but not actively set by the sketch.
-- **Time base**: local time (`TZ`).
+## Protocol Specifications
 
-Disparity: JJY’s symbol shapes are end‑Low here; many references show start‑Low. If you find a receiver picky about edge placement, this is the knob.
+The signal is constructed of **10 ticks** (100ms each) per second.
+Legend: `H` = High Power (~50% duty), `L` = Low Power (~6% duty).
 
-### WWVB (United States)
+### 1. WWVB (USA) - 60 kHz
+*   **Encoding**: Pulse Width Modulation (Start-Low).
+*   **Frame**: 60 Seconds. Bit at second 59 marks the start of the *next* minute.
 
-- **Frequency**: 60 kHz
-- **Symbol shapes**: start‑Low (classic WWVB 0/1/Marker at 0.2/0.5/0.8 s)
-- **Time base**: UTC for numeric fields; DST flags represent US local DST “now” and “tomorrow”.
+| Symbol | Duration (Low) | Pattern (10 ticks) | Description |
+| :--- | :--- | :--- | :--- |
+| **0** | 0.2 s | `LLHHHHHHHH` | Binary Zero |
+| **1** | 0.5 s | `LLLLLHHHHH` | Binary One |
+| **Marker** | 0.8 s | `LLLLLLLLHH` | Frame/Field Marker |
 
-Frame content prepared exactly once per minute (bit 59 = first second):
+**Frame Layout** (MSB First):
+*   **S0, S9, S19...S59**: Fixed Markers. S59 marks the start of the frame.
+*   **Minutes**: BCD (Bits 1-8). Tens sent first.
+*   **Hours**: BCD (Bits 12-18). Tens sent first.
+*   **Day of Year**: BCD (Bits 22-33). Hundreds sent first.
+*   **DUT1**: Sign & Correction (Bits 36-43, 56).
+*   **Year**: BCD (Bits 45-53). Tens sent first.
+*   **DST**: Bit 57 (DST Pending), Bit 58 (DST Active).
+*   **Leap Second**: Bit 59 (LS Pending).
 
-```text
-Minutes   (BCD, 2 digits)
-Hours     (BCD, 2 digits)
-Day-of-yr (BCD, 3 digits)
-Year      (BCD, 2 digits)
-LeapYear  (1 = leap year)
-DST bits  bit57 = DST tomorrow?  bit58 = DST now?
-Markers   seconds 0 and 9 are markers
-```
+### 2. DCF77 (Germany) - 77.5 kHz
+*   **Encoding**: Start-Low.
+*   **Frame**: 59 Seconds (Second 59 is "missing" carrier to mark minute start).
 
-Symbol timing (per second):
+| Symbol | Duration (Low) | Pattern |
+| :--- | :--- | :--- |
+| **0** | 0.1 s | `LHHHHHHHHH` |
+| **1** | 0.2 s | `LLHHHHHHHH` |
+| **Marker** | 0.0 s (High) | `HHHHHHHHHH` | (Used at S59) |
 
-```text
-Sec=0 or 9 : Marker  (Low 0.8 s)
-Data 0-bit : Low 0.2 s
-Data 1-bit : Low 0.5 s
-```
+**Frame Layout** (LSB First):
+*   Bits are transmitted **Least Significant Bit** first.
+*   BCD digits are sent **Ones** then **Tens**.
 
-Important nuance: The code computes DST flags using the process’ local `TZ` rather than hard‑coded US rules. If you set `TZ="UTC0"` (as the README suggests for framing), `tm_isdst` is always 0 → both flags transmit as 0. Use a US DST‑aware `TZ` if you need accurate WWVB DST bits, or adjust code to compute US DST independently of `TZ`.
+| Second | Field | Description |
+| :--- | :--- | :--- |
+| 17 | Z1 | DST Active (Summer) |
+| 18 | Z2 | DST Inactive (Winter) |
+| 21-27 | Minutes | BCD (LSB at 21) |
+| 28 | **Parity** | Even parity for Minutes |
+| 29-34 | Hours | BCD (LSB at 29) |
+| 35 | **Parity** | Even parity for Hours |
+| 36-41 | Day | BCD (LSB at 36) |
+| 42-44 | DOW | Day of Week (LSB at 42) |
+| 45-49 | Month | BCD (LSB at 45) |
+| 50-57 | Year | BCD (LSB at 50) |
+| 58 | **Parity** | Even parity for Date |
+| 59 | **Skip** | No modulation (Minute Marker) |
 
-Compatibility toggles (`n` next‑minute, `q` pending) are accepted but have no effect; framing follows the standard “txtempus” interpretation.
+### 3. JJY (Japan) - 40 / 60 kHz
+*   **Encoding**: **End-Low**.
+*   **Frame**: 60 seconds (Markers at 9, 19, 29, 39, 49, 59).
 
-### DCF77 (Germany)
+| Symbol | Description | Pattern (High -> Low) |
+| :--- | :--- | :--- |
+| **0** | Binary Zero | `HHHHHHHHLL` (0.8s High, 0.2s Low) |
+| **1** | Binary One | `HHHHHLLLLL` (0.5s High, 0.5s Low) |
+| **Marker** | Marker | `HHLLLLLLLL` (0.2s High, 0.8s Low) |
 
-- **Frequency**: 77.5 kHz
-- **Symbol shapes**: start‑Low (0 = 100 ms, 1 = 200 ms)
-- **Time base**: local time (`TZ`), including seasonal flags Z1/Z2.
+**Frame Layout** (MSB First):
+*   Bits within fields are MSB first.
+*   BCD digits are sent **Tens** then **Ones**.
 
-Frame layout (LSB→MSB within fields):
+| Second | Field | Description |
+| :--- | :--- | :--- |
+| 1-3 | Minutes (Tens) | BCD value (e.g. 40 -> 4) |
+| 5-8 | Minutes (Ones) | BCD value |
+| 9 | **Marker** | Fixed P-Marker |
+| 10-11 | Reserved | Fixed 0 |
+| 12-13 | Hours (Tens) | BCD value |
+| 15-18 | Hours (Ones) | BCD value |
+| 19 | **Marker** | Fixed P-Marker |
+| 20-21 | Reserved | Fixed 0 |
+| 22-23 | DOY (Hundreds) | Day of Year (100s) |
+| 25-28 | DOY (Tens) | Day of Year (10s) |
+| 29 | **Marker** | Fixed P-Marker |
+| 30-33 | DOY (Ones) | Day of Year (1s) |
+| 36 | **Parity** | Even parity for Hours (12-18) |
+| 37 | **Parity** | Even parity for Minutes (1-8) |
+| 39 | **Marker** | Fixed P-Marker |
+| 41-44 | Year (Tens) | Year since 2000 (Tens) |
+| 45-48 | Year (Ones) | Year since 2000 (Ones) |
+| 49 | **Marker** | Fixed P-Marker |
+| 50-52 | DOW | Day of Week (0=Sun, 6=Sat) |
+| 53-54 | LS1 / LS2 | Leap Second info (Fixed 0 in this impl) |
+| 59 | **Marker** | Fixed M-Marker (Start of Frame) |
 
-```text
- 0..14 : reserved (0)
- 15..19: reserved, then Z flags
-   17  : Z1 (DST=1/STD=0)
-   18  : Z2 (DST=0/STD=1)
- 21..27: Minutes (BCD, LSB→MSB), P1 at 28
- 29..34: Hours   (BCD),         P2 at 35
- 36..41: Day     (BCD)
- 42..44: DOW     (binary)
- 45..49: Month   (BCD)
- 50..57: Year    (BCD),         P3 at 58
- 59    : Missing second (minute marker)
-```
+### 4. MSF (UK) - 60 kHz
+*   **Encoding**: Start-Low, with unique parity symbols.
+*   **Frame**: 60 Seconds.
 
-Note: Original comment hints DCF/MSF “forward 1 minute”; this sketch encodes the current minute values as shown (no +1 minute advance).
+| Symbol | Duration (Low) | Pattern |
+| :--- | :--- | :--- |
+| **0** | 0.1 s | `LHHHHHHHHH` |
+| **1** | 0.2 s | `LLHHHHHHHH` |
+| **Marker** | 0.5 s | `LLLLLHHHHH` | Minute Marker (S0) |
+| **Parity** | Distinct shapes | `LLLHHHHHHH` (Parity version of 0/1 bits) |
 
-### MSF (United Kingdom)
+**Frame Layout**:
 
-- **Frequency**: 60 kHz
-- **Symbol shapes**: 4 symbols; parity seconds use special variants.
-- **Time base**: local time (`TZ`).
+| Second | Field | Description |
+| :--- | :--- | :--- |
+| 0 | **Marker** | Minute Marker |
+| 01-16 | Reserved | Fixed 0 |
+| 17-24 | Year | BCD (Tens: 17-20, Ones: 21-24) |
+| 25-29 | Month | BCD (Tens: 25, Ones: 26-29) |
+| 30-35 | Day | BCD (Tens: 30-31, Ones: 32-35) |
+| 36-38 | DOW | Day of Week (0=Sun, 6=Sat) |
+| 39-44 | Hours | BCD (Tens: 39-40, Ones: 41-44) |
+| 45-51 | Minutes | BCD (Tens: 45-47, Ones: 48-51) |
+| 54 | **Parity** | Year (17-24) |
+| 55 | **Parity** | Month + Day (25-35) |
+| 56 | **Parity** | DOW (36-38) |
+| 57 | **Parity** | Time (39-51) |
+| 58 | DST | Summer Time Flag |
 
-Fields (high‑level):
+### 5. BPC (China) - 68.5 kHz
+*   **Encoding**: Quaternary (4-level pulse width).
+*   **Structure**: One frame = 20 seconds. The frame is repeated 3 times per minute (at 00-19, 20-39, 40-59).
+*   **Symbols**:
+    *   `0` (00): 1 Pulse (0.1s Low)
+    *   `1` (01): 2 Pulses (0.2s Low)
+    *   `2` (10): 3 Pulses (0.3s Low)
+    *   `3` (11): 4 Pulses (0.4s Low)
+    *   `Marker`: 0 Pulses (No modulation)
 
-```text
-Year (BCD, 8) → Month (BCD, 5) → Day (BCD, 6) → DOW (3)
-→ Hour (BCD, 6) → Minute (BCD, 7)
-Parities (4 seconds): Pyear, Pdate, Pdow, Ptime
-Summertime indicator: dedicated second uses P0/P1 shape
-```
+**Frame Layout (20s Sub-frame)**:
 
-Parity seconds transmit as `SP_P0` (parity 0) or `SP_P1` (parity 1), which have distinct Low durations so receivers can identify parity vs data.
+| Offset | Field | Description |
+| :--- | :--- | :--- |
+| 0 | **Marker** | Sub-frame Sync |
+| 1 | Reserved | |
+| 3-4 | Hours | Hour % 12 (Base-4 encoded) |
+| 5-7 | Minutes | Minute (Base-4) |
+| 8-9 | DOW | Day of Week (Base-4) |
+| 10 | Hour/Parity | AM/PM bit + Parity for Time |
+| 11-13 | Day | Day (Base-4) |
+| 14-15 | Month | Month (Base-4) |
+| 16-18 | Year | Year (Base-4) |
+| 19 | **Parity** | Parity for Date |
 
-### BSF (Taiwan)
+*Note: For `clocksync`, seconds 0-1 and 0-2 (in copies) are filled with Marker/Reserved according to standard.*
 
-- **Frequency**: 77.5 kHz
-- **Encoding**: quaternary (2‑bit symbols) + marker symbol.
-- **Status**: Marked “not certified” in code.
+### 6. BSF (Taiwan) - 77.5 kHz
+*   **Encoding**: Quaternary.
+*   **Status**: Reverse-engineered.
+*   **Layout**:
 
-High‑level mapping (quaternary BCD across fields; parity bits qparity indicated in comments): minutes, hours×2, day×2, DOW split, month, year×2, with two parity checks. Minute markers at 0, 39, 59 seconds.
-
-### BPC (China)
-
-- **Frequency**: 68.5 kHz
-- **Encoding**: quaternary (2‑bit symbols) + marker symbol, with three repeats.
-
-Layout (conceptual):
-
-```text
-Preamble/Marker; P1; P2; Hour(12h); Minute; DOW; Par <hmDOW>
-Date block: Day; Month; Year; Par <DMY>
-The 20-second payload repeats 3× to fill 60 seconds
-```
-
-The sketch copies seconds 2..19 into 20..39 and 40..59, yielding 3 identical sub‑frames per minute.
-
-## Architecture details
-
-- **Aligned start**: A one‑shot timer fires exactly at the next real‑time second boundary (computed from `gettimeofday()`), then starts a periodic 100 ms timer.
-- **Carrier control**: Each 100 ms tick toggles the LEDC duty between high and low power. WWVB computes “low‑ticks” directly; other stations use a per‑symbol `secpattern` lookup.
-- **Persistence**: Selected station, radio pin, NTP on/off, LED, DST override, and WWVB pending override persist via `Preferences`.
-- **Self‑test**: `f` command measures carrier by counting edges on a measurement pin for ~200 ms.
-
-## Command quick reference (Serial and HTTP `/cmd?c=`)
-
-```text
-h            help
-y0|y1        NTP sync off/on
-dYYMMDD      set date (local TZ)
-tHHmmSS      set time (local TZ)
-z0|z1        buzzer off/on
-l0|l1        LED off/on
-pNN          set radio GPIO (e.g., p25)
-f            frequency self-test (jumper radio to meas pin; default meas pin GPIO33)
-n0|n1        WWVB next-minute (compat only; no effect)
-q0|q1|q2     WWVB pending (compat only; no effect)
-x0|x1|x2     DST STD/DST/AUTO (applies to DCF/MSF)
-s[jkwtmc]    station: JJY_E, JJY_W, WWVB, DCF77, MSF, BPC (BSF via 't')
-```
-
-## Rough edges, disparities, and notes
-
-- **WWVB DST bits vs TZ**: DST “now/tomorrow” flags are derived from the process’ `TZ`. If `TZ` is `UTC0` (as recommended for WWVB framing), both flags will be 0 all year. Consider either (a) setting a US DST‑aware `TZ`, or (b) computing US DST independently of `TZ` for the WWVB flags.
-- **JJY symbol phase**: JJY uses end‑Low symbols here; many references show start‑Low. Most receivers will accept either; a few might be edge‑sensitive.
-- **DCF77/MSF minute advance**: The header comment says “forwards 1 minute”, but the code encodes the current minute. If your receiver expects “next minute” encoding, you may need to advance fields by 1 minute at frame build time.
-- **Leap second flags (JJY)**: `LS1/LS2` are present in the frame map but not populated by this sketch.
-- **Amplitude ratio**: The reduced carrier is approximated by a lower PWM duty, not a calibrated dB reduction. This is usually fine for near‑field coupling.
-- **BSF/BPC**: Marked as “not certified” by the original author; expect receiver variability.
-- **Marker conventions**: DCF77 ends the minute with a missing 59th second. WWVB uses 0 and 9 as marker seconds. JJY uses markers every 10 seconds. MSF uses a distinct “M” symbol at its marker second.
-
-## Quick mental model (ASCII)
-
-One minute, 60 columns, with marker seconds (M) and data seconds (D):
-
-```text
-JJY:  M D D D D D D D D M  D D D D D D D D M  D D D D D D D D M  D D D D D D D D M  D D D D D D D D M  D D D D D D D D M
-WWVB: M D D D D D D D D M  D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D D
-DCF : D D D D D D D D D D  D D D D D D D D D D  D D D D D D D D D D  D D D D D D D D D D  D D D D D D D D D D  D D D D D D  -
-MSF : D D D D D D D D D D  D D D D D D D D D D  D D D D D D D D D D  D D D D D D D D D D  P P P P S  (P=parity, S=summertime)
-```
-
-If you can picture those markers and the Low‑duration patterns per second, you already “get” how these stations work.
-
-
+| Second | Field | Description |
+| :--- | :--- | :--- |
+| 41-43 | Minutes | BCD |
+| 44-46 | Hours | BCD |
+| 47-49 | Day | BCD |
+| 50 | DOW | Day of Week (0=Sun, 6=Sat) |
+| 51-52 | Month | BCD |
+| 53-56 | Year | BCD (Year since 2000) |
+| 46, 56 | Parity | Parity bits mixed in |
