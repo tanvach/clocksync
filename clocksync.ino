@@ -43,7 +43,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <ArduinoOTA.h>
+#include <WebServer.h>
 // M5 Atom Lite support (RGB LED, button, etc.)
 #include <M5Atom.h>
 // Drive strength configuration for safe antenna drive
@@ -303,7 +303,6 @@ Preferences prefs;
 String lastCmdResp;
 int ledEnabled = 1;                // 0=off, 1=on (M5 LED or PIN_LED)
 static int lastLedState = -1;      // -1 unknown, 0 off, 1 on, -2 disabled
-bool otaUpdating = false;          // Guard to pause loop during OTA
 
 // LEDC carrier generation (single output pin)
 
@@ -376,7 +375,6 @@ void prepareWWVBMinuteBits(time_t minuteStartUTC);
   void saveSettings(void);
   void loadSettings(void);
   void applyDefaultSettings(void);
-  void setupOTA(void);
 // GPIO helpers
 int clampDriveCap(int cap);
 void applyDriveStrength(void);
@@ -410,13 +408,22 @@ void setup(void) {
 
   // HTTP server provides control/status.
 
+  // Ensure max performance for network services
+  WiFi.setSleep(false);
+
   // Load persisted settings before initializing subsystems
   loadSettings();
   if (ntpsync) {
     ntpstart();
   }
-  // Safe to init OTA if WiFi connected (Starts mDNS)
-  setupOTA();
+
+  // Explicitly start mDNS after WiFi is connected (ntpstart connects WiFi)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (MDNS.begin(DEVICENAME)) {
+      LOG_PRINTLN("mDNS responder started: " DEVICENAME ".local");
+    }
+  }
+
   // Start HTTP control/status server
   setupWebServer();
   // Prepare radio pin
@@ -461,12 +468,6 @@ void loop() {
   static char usb[128];
   static int usbp = 0;
 
-  // Urgent: Handle OTA first and skip everything else if updating
-  ArduinoOTA.handle();
-  if (otaUpdating) {
-    yield(); // Let WiFi stack flow (more responsive than delay)
-    return;
-  }
 
   // Update M5 state (button, etc.)
   M5.update();
@@ -587,17 +588,18 @@ void starttimer(void) {
 }
 
 void stoptimer(void) {
-  if (align_timer) {
-    esp_timer_stop(align_timer);
+  if (istimerstarted) {
+    if (align_timer) {
+      esp_timer_stop(align_timer);
+    }
+    if (tick_timer) {
+      esp_timer_stop(tick_timer);
+    }
+    // Turn off carrier
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_ID, 0);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_ID);
+    istimerstarted = 0;
   }
-  if (tick_timer) {
-    esp_timer_stop(tick_timer);
-  }
-  // Turn off carrier
-  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_ID, 0);
-  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_ID);
-  istimerstarted = 0;
-  return;
 }
 
 // setup amplitude value ampmod depends on bit pattern & 0.1 second frame
@@ -1513,6 +1515,7 @@ void handleRoot(void) {
   s += "document.getElementById('setDrive').addEventListener('click',function(ev){ev.preventDefault();var dmsg=document.getElementById('drvmsg');dmsg.textContent='';fetch('/cmd?c=g'+encodeURIComponent(driveSel.value)).then(r=>r.text()).then(t=>{var ok=(t.indexOf('OK')===0);dmsg.style.color=ok?'#080':'#a00';dmsg.textContent=ok?'updated':'ERR';return ok?fetchStatus():null;}).catch(()=>{dmsg.style.color='#a00';dmsg.textContent='ERR';});});\n";
   // No periodic refresh to minimize WiFi usage
   s += "})();</script>";
+  s += "</div></body></html>";
   server.send(200, "text/html", s);
 }
 
@@ -1520,10 +1523,12 @@ void setupWebServer(void) {
   server.on("/", handleRoot);
   server.on("/status.txt", HTTP_GET, handleStatus);
   server.on("/cmd", HTTP_GET, handleCmd);
+  
+
   server.onNotFound([](){ server.send(404, "text/plain", "not found\n"); });
   server.begin();
   if (WiFi.status() == WL_CONNECTED) {
-    // Note: MDNS.begin(DEVICENAME) is called by ArduinoOTA.begin() in setupOTA().
+    // Note: MDNS.begin(DEVICENAME) is called explicitly in setup().
     // We just need to add the service here.
     MDNS.addService("http", "tcp", 80);
     LOG_PRINTF("HTTP server: http://%s.local/\n", DEVICENAME);
@@ -1532,47 +1537,6 @@ void setupWebServer(void) {
   }
 }
 
-void setupOTA(void) {
-  if (WiFi.status() != WL_CONNECTED) {
-    LOG_PRINTLN("OTA init skipped (no WiFi)");
-    return;
-  }
-  // Ensure max performance for OTA (disable power save)
-  WiFi.setSleep(false);
-  ArduinoOTA.setHostname(DEVICENAME);
-  ArduinoOTA.setPassword("clocksync");
-  ArduinoOTA.onStart([]() {
-    // Enter safe mode: stop timers and block loop
-    otaUpdating = true;
-    stoptimer();
-    // Note: Do not touch M5/LED here or do complex things that might crash
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH)
-      type = "sketch";
-    else // U_SPIFFS
-      type = "filesystem";
-    // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-    LOG_PRINTLN("Start updating " + type);
-  });
-  ArduinoOTA.onEnd([]() {
-    otaUpdating = false;
-    LOG_PRINTLN("\nEnd");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    // printf is safe here (not in interrupt context)
-    // Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) LOG_PRINTLN("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) LOG_PRINTLN("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) LOG_PRINTLN("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) LOG_PRINTLN("Receive Failed");
-    else if (error == OTA_END_ERROR) LOG_PRINTLN("End Failed");
-  });
-  ArduinoOTA.begin();
-  LOG_PRINTLN("OTA Ready");
-}
 
 
 void ntpstart(void) {

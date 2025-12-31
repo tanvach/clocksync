@@ -120,20 +120,6 @@ This fork is customized for the M5 Atom Lite by default (RGB LED via M5Atom libr
 - The data stream (minute frame layout and amplitude patterns) is based on and cross-checked with `txtempus`, a well-known Raspberry Pi/JETSON transmitter reference implementation. See: [hzeller/txtempus](https://github.com/hzeller/txtempus).
 - When this project mentions “txtempus framing” or “txtempus defaults” in logs/help, it means the on-air bit layout matches `txtempus`’s interpretation of the respective time service. Legacy toggles such as WWVB next-minute or pending overrides are accepted for compatibility but have no effect here; clocksync always encodes WWVB per the standard frame (UTC time-base; DST-now/tomorrow bits set automatically).
     
-## OTA Updates
-
-This firmware supports Over-The-Air (OTA) updates via the Arduino IDE/PlatformIO.
-
-1.  **First Flash**: Must be done via USB to install the OTA-capable firmware.
-2.  **Network Port**: Once connected to WiFi, the device will appear as a network port named `clocksync` (or your configured `DEVICENAME`) in the Arduino IDE "Port" menu.
-3.  **Upload**: Select the network port and click Upload.
-    -   **Password**: If asked, enter `clocksync`.
-    -   The device will receive the new firmware and reboot.
-
-> [!NOTE]
-> OTA is only enabled if the device successfully connects to WiFi on boot.
->
-> **Important**: The Serial Monitor is **not available** over the network port. To view logs or debugging information, you must connect the device via USB.
 
 ## Home Assistant scheduling (optional)
 
