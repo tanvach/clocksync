@@ -65,10 +65,20 @@ This project is a maintained fork of the original `nisejjy` project by SASAKI Ta
     *   Find the line `#define TZ "..."`.
     *   Change the string to match your location (see examples in the file).
     *   *Note*: For **WWVB**, it is best to use `"UTC0"` and let the code handle DST, or your clock might have a double-offset error.
-3.  **Upload**:
-    *   **Install Library**: In Arduino IDE, go to `Sketch` -> `Include Library` -> `Manage Libraries...`. Search for and install **`M5Atom`** by M5Stack.
-    *   **Select Board**: Go to `Tools` -> `Board` and select **M5Stack-ATOM** (or "ESP32 Dev Module").
-    *   **Upload**: Connect your device and click the Arrow icon (→).
+3.  **Dependencies & Upload**:
+    *   **Using Arduino IDE**:
+        1.  **Add Board URL**: Go to `File` -> `Preferences` -> `Additional boards manager URLs` and add `https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json`.
+        2.  **Install Board**: Go to `Tools` -> `Board` -> `Boards Manager`, search for **M5Stack** and install it.
+        3.  **Install Library**: Go to `Sketch` -> `Include Library` -> `Manage Libraries...`. Search for and install **M5Atom** by M5Stack.
+        4.  **Select & Upload**: Select **M5Stack-ATOM** (or "ESP32 Dev Module") from the `Tools` -> `Board` menu, connect your device, and click Upload (→).
+    *   **Using arduino-cli**:
+        ```bash
+        arduino-cli core update-index --additional-urls https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+        arduino-cli core install m5stack:esp32 --additional-urls https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+        arduino-cli lib install M5Atom
+        arduino-cli compile --fqbn m5stack:esp32:m5stack_atom clocksync.ino
+        arduino-cli upload -p /dev/ttyUSB0 --fqbn m5stack:esp32:m5stack_atom clocksync.ino
+        ```
 
 ### 3. Usage
 

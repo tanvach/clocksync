@@ -288,6 +288,10 @@ String lastCmdResp;
 int ledEnabled = 1;                // 0=off, 1=on (M5 LED or PIN_LED)
 static int lastLedState = -1;      // -1 unknown, 0 off, 1 on, -2 disabled
 
+// WiFi Reconnect Tracking
+static unsigned long lastWiFiCheckTime = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 60000; // 60 seconds
+
 // LEDC carrier generation (single output pin)
 
 // LEDC carrier generation (single output pin)
@@ -452,6 +456,18 @@ void loop() {
   static char usb[128];
   static int usbp = 0;
 
+  // Non-blocking WiFi reconnect check
+  if (ntpsync) {
+    unsigned long currentMillis = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      lastWiFiCheckTime = currentMillis; // Constantly reset while connected
+    } else if (currentMillis - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
+      lastWiFiCheckTime = currentMillis;
+      LOG_PRINTLN("WiFi disconnected. Attempting reconnect...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, passwd); // Re-initiate connection
+    }
+  }
 
   // Update M5 state (button, etc.)
   M5.update();
@@ -1468,6 +1484,7 @@ void setupWebServer(void) {
   if (WiFi.status() == WL_CONNECTED) {
     // Note: MDNS.begin(DEVICENAME) is called explicitly in setup().
     // We just need to add the service here.
+    MDNS.begin(DEVICENAME);
     MDNS.addService("http", "tcp", 80);
     LOG_PRINTF("HTTP server: http://%s.local/\n", DEVICENAME);
   } else {
