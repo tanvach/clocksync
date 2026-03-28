@@ -601,9 +601,11 @@ void stoptimer(void) {
     if (tick_timer) {
       esp_timer_stop(tick_timer);
     }
-    // Turn off carrier
+    // Turn off carrier and tristate the pin (high-impedance).
+    // Avoid ledc_stop() which can pause the timer and cause restart issues.
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_ID, 0);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_ID);
+    pinMode(pinRadio, INPUT);  // detach LEDC, Hi-Z: no current through antenna
     istimerstarted = 0;
   }
 }
@@ -1208,11 +1210,10 @@ int docmd(char *buf) {
       return 1;
     }
     stoptimer();
-    pinMode(oldPin, OUTPUT);
-    digitalWrite(oldPin, LOW);
+    pinMode(oldPin, INPUT);        // tristate old pin (Hi-Z)
     pinRadio = newPin;
     pinMode(pinRadio, OUTPUT);
-    digitalWrite(pinRadio, LOW);
+    digitalWrite(pinRadio, LOW);   // new pin ready for LEDC
     applyDriveStrength();
     if (txEnabled) {
       starttimer();
@@ -1630,11 +1631,10 @@ void applyDefaultSettings(void) {
   int defaultPin = PIN_RADIO;
   if (pinRadio != defaultPin) {
     stoptimer();
-    pinMode(pinRadio, OUTPUT);
-    digitalWrite(pinRadio, LOW);
+    pinMode(pinRadio, INPUT);      // tristate old pin (Hi-Z)
     pinRadio = defaultPin;
     pinMode(pinRadio, OUTPUT);
-    digitalWrite(pinRadio, LOW);
+    digitalWrite(pinRadio, LOW);   // new pin ready for LEDC
   }
   driveStrength = GPIO_DRIVE_CAP_2;
   applyDriveStrength();

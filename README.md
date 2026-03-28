@@ -10,6 +10,7 @@ This project is a maintained fork of the original `nisejjy` project by SASAKI Ta
 
 - **Prevent NVS flash wear**: Added `WiFi.persistent(false)` to stop the WiFi library from writing credentials to flash on every connect/disconnect cycle.
 - **Buzzer default off**: Buzzer now defaults to off on fresh install and reset.
+- **Tristate radio pin when TX off**: Radio output pin is now set to high-impedance (INPUT) when TX is disabled or when switching pins, instead of being driven LOW.
 
 ### What's New in v1.3
 
