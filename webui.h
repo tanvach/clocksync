@@ -60,6 +60,7 @@ button:disabled{opacity:.4}
 button.link{border:0;padding:0;color:var(--acc);border-radius:0}
 .note{color:var(--mut);font-size:12px;margin:8px 0 0}
 .note:empty{display:none}
+.note.ok{color:var(--acc);font-size:14px}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer}
 li:hover span:first-child{color:var(--acc)}
@@ -147,7 +148,7 @@ a{color:var(--acc);text-decoration:none}
 var $ = function (id) { return document.getElementById(id); };
 var REPO = 'https://github.com/tanvach/clocksync', INSTALLER = 'https://tanvach.github.io/clocksync/';
 var S = null, base = 0, baseAt = 0, zones = null, pollTimer = 0, lastTrace = '';
-var wifiWatch = null, wifiOpen = false, customPending = false, built = {};
+var wifiWatch = null, wifiOpen = false, customPending = false, setupDone = false, built = {};
 
 function pad(n) { return (n < 10 ? '0' : '') + n; }
 function hms(d) { return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()); }
@@ -289,14 +290,20 @@ function renderWifi() {
   $('wifiSec').classList.toggle('first', w.ap && !w.connected);
   if (!$('ssid').value && w.ssid) $('ssid').value = w.ssid;
 
-  var m = $('wifiMsg');
+  var m = $('wifiMsg'), link = '<a href="http://' + esc(S.host) + '.local/">' + esc(S.host) + '.local</a>';
   if (wifiWatch) {
     if (w.connected && w.ssid === wifiWatch.ssid) {
-      m.innerHTML = 'Connected. Open <a href="http://' + esc(S.host) + '.local/">' + esc(S.host) + '.local</a>' +
-        (w.ap ? ' after rejoining ' + esc(w.ssid) + '.' : '.');
+      // Seen through the setup hotspot, which closes about 20 s after this.
+      setupDone = w.ap;
+      m.className = 'note ok';
+      m.innerHTML = w.ap
+        ? 'Connected to ' + esc(w.ssid) + '. You can close this page: the setup hotspot turns off in a few seconds ' +
+          'and your phone goes back to your usual Wi-Fi. The clock is then at ' + link + '.'
+        : 'Connected. The clock is at ' + link + '.';
       wifiWatch = null;
       wifiOpen = false;
     } else if (!w.connecting && w.error && Date.now() - wifiWatch.at > 4000) {
+      m.className = 'note';
       m.textContent = 'Could not connect: ' + w.error + '.';
       wifiWatch = null;
     }
@@ -379,10 +386,15 @@ function buildZones(text) {
 
 function refresh() {
   return api('/api/status').then(render).catch(function () {
+    if (setupDone) {  // the setup hotspot closed as planned
+      $('state').className = 'tag on';
+      $('stateText').textContent = 'Setup done';
+      return;
+    }
     $('state').className = 'tag bad';
     $('stateText').textContent = 'Offline';
     if (wifiWatch && Date.now() - wifiWatch.at > 3000) {
-      $('wifiMsg').textContent = 'Lost the setup hotspot, which usually means it connected. Rejoin ' + wifiWatch.ssid +
+      $('wifiMsg').textContent = 'The setup hotspot closed, which usually means it connected. Rejoin ' + wifiWatch.ssid +
         ' and open ' + (S ? S.host : 'clocksync') + '.local';
     }
   });
