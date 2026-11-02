@@ -1,4 +1,5 @@
-# Builds the firmware for every board. Pushes to master publish the browser
+# Builds the firmware for every board. Pull requests only test and build
+# (the images are attached to the run); pushes to master publish the browser
 # installer to GitHub Pages; v* tags attach the images to a GitHub release.
 # (The default github-pages environment only accepts deploys from the
 # default branch, so tags don't deploy.)
@@ -10,16 +11,16 @@ on:
   push:
     branches: [master]
     tags: ["v*"]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   ESP32_CORE: "3.3.5"
@@ -28,6 +29,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # attach images to the release on tags
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +47,15 @@ jobs:
       - name: Build firmware and installer site
         run: tools/build_installer.sh _site
 
+      - name: Keep the firmware images with the run
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: _site/downloads/*.bin
+
       - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/master'
         with:
           path: _site
 
@@ -58,6 +69,9 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

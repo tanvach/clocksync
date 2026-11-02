@@ -239,7 +239,7 @@ python3 tools/gen_tzdata.py > tzdata.h   # refresh time zones from the system's 
 tools/build_installer.sh _site    # build all boards and the browser installer into _site/
 ```
 
-**Releases.** [`.github/workflows/release.yml`](./.github/workflows/release.yml) runs the tests and builds every board. Each push to `master` republishes the installer page on GitHub Pages; pushing a `v*` tag also attaches the images to a GitHub release. One-time setup: repository **Settings → Pages → Source: GitHub Actions**. To release, bump `VERSION` in `clocksync.ino`, push to `master`, then tag:
+**Releases.** [`.github/workflows/release.yml`](./.github/workflows/release.yml) runs the tests and builds every board. Pull requests stop there (the images are attached to the run); each push to `master` republishes the installer page on GitHub Pages; pushing a `v*` tag also attaches the images to a GitHub release. One-time setup: repository **Settings → Pages → Source: GitHub Actions**. To release, bump `VERSION` in `clocksync.ino`, push to `master`, then tag:
 
 ```bash
 git tag v2.0.0 && git push origin v2.0.0
