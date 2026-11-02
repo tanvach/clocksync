@@ -108,9 +108,9 @@ The antenna pin can be changed in the web UI (Advanced → Antenna pin). Edit [`
 ### 3. Set up
 
 1.  On your phone or computer, join the Wi-Fi network **`clocksync-setup`**. The setup page usually opens by itself; if not, browse to `http://192.168.4.1`.
-2.  Pick your network, enter its password and press **Connect**. The device fetches the time over NTP and starts transmitting.
-3.  Choose your **Station**, the one your clock is made for. It usually says so on the clock or in its manual.
-4.  Rejoin your normal Wi-Fi. The page is now at **`http://clocksync.local`** (or the IP your router assigned).
+2.  Choose your **Station**, the one your clock is made for. It usually says so on the clock or in its manual.
+3.  Pick your network, enter its password and press **Connect**. Once it says *Connected*, you're done: the device fetches the time and starts transmitting (LED green), and the setup hotspot turns off about 20 s later so your phone goes back to your usual Wi-Fi. You can close the page.
+4.  From then on the page is at **`http://clocksync.local`** on your usual network (or the IP your router assigned).
 
 No internet? Press **Set from this device** to copy the time from your phone, and turn off Internet time under Advanced.
 
@@ -126,12 +126,12 @@ No internet? Press **Set from this device** to copy the time from your phone, an
 
 **Button**:
 - Short press: transmitter on/off.
-- Hold 3 s (the LED turns blue after 1 s): open the setup hotspot, e.g. to change Wi-Fi.
+- Hold about 2 s, until the LED blinks blue: the setup hotspot is open, e.g. to change Wi-Fi. It closes 10 minutes after the last phone leaves it.
 
 **Status LED** (single-color LEDs show the same patterns without the colors; the setup blink is faster):
 - Green, flickering with the signal: transmitting.
 - Slow amber blink: waiting for the time.
-- Blue blink: setup hotspot is on.
+- Blue blink: setup hotspot is on (opened with the button, or Wi-Fi not set up yet).
 - Off: transmitter off (or LED disabled in the UI).
 
 ### Time Zones
@@ -149,7 +149,7 @@ The time zone decides which local time is encoded. Leave it on **Auto** unless y
 
 Pick a different zone when you want a DCF77/MSF/JJY clock to show another local time (for example a DCF77 clock used in New York). A custom POSIX TZ rule can also be entered.
 
-The device opens the setup hotspot again if it can't reach the saved network for 20 s after boot, or for 5 minutes later on. It keeps retrying in the background and closes the hotspot once connected, so a power cut that outlasts the router reboot recovers by itself.
+The device opens the setup hotspot again if it can't reach the saved network for 1 minute after boot, or for 5 minutes later on. It keeps retrying in the background and closes the hotspot 20 s after it connects, so a power cut that outlasts the router reboot recovers by itself.
 
 ## Command Reference
 
@@ -210,7 +210,7 @@ Copy [`secrets_example.h`](./secrets_example.h) to `secrets.h` to pre-load Wi-Fi
 | **BPC** | 68.5 | China | Quaternary encoding (uncertified). |
 
 ## Troubleshooting
-*   **Can't find the setup page**: join `clocksync-setup`, then open `http://192.168.4.1`. Hold the button 3 s to reopen the hotspot.
+*   **Can't find the setup page**: join `clocksync-setup`, then open `http://192.168.4.1`. Hold the button until the LED blinks blue to reopen the hotspot.
 *   **`clocksync.local` doesn't open**: some Android versions don't support `.local` names. Use the IP address shown on the setup page or in your router.
 *   **Clock isn't syncing**:
     *   **Station**: check it matches your clock (WWVB/DCF77/MSF/JJY...). With JJY, try both 40 and 60 kHz.

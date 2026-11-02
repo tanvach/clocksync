@@ -7,7 +7,7 @@
 //   RADIO_PIN    default antenna output
 //   MEAS_PIN     input for the frequency self-test ("f" command), -1 = none
 //   BUTTON_PIN   active-low button, -1 = none (short press: TX on/off,
-//                hold 3 s: open the Wi-Fi setup hotspot)
+//                hold 2 s: open the Wi-Fi setup hotspot)
 //   BUTTON_PULLUP  1 to enable the internal pull-up on BUTTON_PIN
 //   LED_PIN      status LED, -1 = none
 //   LED_RGB      1 = addressable RGB LED (WS2812/SK6812), 0 = plain LED

@@ -61,11 +61,12 @@
 // Any time before this is "clock not set" (the ESP32 boots in 1970).
 static const time_t VALID_TIME = 1704067200;  // 2024-01-01
 static const IPAddress AP_IP(192, 168, 4, 1);
-static const uint32_t AP_AFTER_BOOT_MS = 20000;      // no Wi-Fi this long after boot: open hotspot
+static const uint32_t AP_AFTER_BOOT_MS = 60000;      // no Wi-Fi this long after boot: open hotspot
 static const uint32_t AP_AFTER_DROPOUT_MS = 300000;  // lost Wi-Fi this long: open hotspot
 static const uint32_t STA_RETRY_MS = 10000;          // reconnect attempts
 static const uint32_t STA_RETRY_AP_MS = 30000;       // ... while the setup hotspot is up
 static const uint32_t STA_RETRY_BUSY_MS = 180000;    // ... while someone is connected to it
+static const uint32_t AP_CLOSE_AFTER_SETUP_MS = 20000;  // hotspot lingers this long once Wi-Fi works
 static const size_t HOST_MAX = 26;                   // "<name>-setup" must fit a 32-byte SSID
 static const int SAFE_PIN_LIST[] = SAFE_PINS;
 
@@ -126,6 +127,8 @@ static uint32_t connectedSinceMs = 0;
 static uint32_t lastConnectedMs = 0;
 static uint32_t lastStaAttemptMs = 0;
 static uint32_t retryNotBeforeMs = 0;  // a Wi-Fi scan holds off reconnects
+static bool reconnectPending = false;   // new credentials: reconnect once the reply is out
+static uint32_t reconnectAtMs = 0;
 static uint32_t apFailedMs = 0;
 static volatile int lastDisconnectReason = 0;
 static bool mdnsStarted = false;
@@ -618,8 +621,14 @@ static void setClock(time_t sec, long usec) {
 
 // ---------------------------------------------------------------------- wifi
 
-static void startMdns() {
-  if (mdnsStarted) return;
+// Restarted on every Wi-Fi connection: if mDNS first started while only the
+// hotspot was up, it would not answer on the home network.
+static void startMdns(bool restart) {
+  if (mdnsStarted && !restart) return;
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+  }
   if (MDNS.begin(hostActive)) {
     MDNS.addService("http", "tcp", 80);
     mdnsStarted = true;
@@ -654,7 +663,7 @@ static void startAP(bool manual) {
   apFailedMs = 0;
   dns.start(53, "*", AP_IP);
   apActive = true;
-  startMdns();
+  startMdns(false);
   Serial.printf("wifi: setup hotspot \"%s\" at http://%s/\n", apSsid().c_str(), AP_IP.toString().c_str());
 }
 
@@ -711,6 +720,11 @@ static void wifiSetup() {
 
 static void wifiLoop() {
   uint32_t now = millis();
+  if (reconnectPending && (int32_t)(now - reconnectAtMs) >= 0) {
+    reconnectPending = false;
+    WiFi.disconnect();
+    staBegin();
+  }
   bool up = connected();
   if (up && !wasConnected) {
     everConnected = true;
@@ -718,7 +732,7 @@ static void wifiLoop() {
     lastDisconnectReason = 0;
     Serial.printf("wifi: connected to \"%s\", http://%s/ (http://%s.local/)\n", cfg.ssid,
                   WiFi.localIP().toString().c_str(), hostActive);
-    startMdns();
+    startMdns(true);
     if (cfg.ntp) ntpStart();
   } else if (!up && wasConnected) {
     Serial.println("wifi: disconnected");
@@ -728,10 +742,13 @@ static void wifiLoop() {
   if (up) {
     lastConnectedMs = now;
     if (apActive) {
-      // Keep the hotspot open a little so the setup page can show the new address.
+      // A hotspot that was only needed until Wi-Fi works closes shortly after,
+      // even with a phone on it, so phones go back to their usual network.
+      // One opened with the button stays while it is in use.
       uint32_t since = now - (connectedSinceMs > apStartedMs ? connectedSinceMs : apStartedMs);
-      uint32_t grace = apManual ? 600000 : 60000;
-      if ((since > grace && WiFi.softAPgetStationNum() == 0) || since > 900000) stopAP();
+      bool done = apManual ? (since > 600000 && WiFi.softAPgetStationNum() == 0) || since > 900000
+                           : since > AP_CLOSE_AFTER_SETUP_MS;
+      if (done) stopAP();
     }
     return;
   }
@@ -756,8 +773,11 @@ static void setWifi(const char *ssid, const char *pass) {
   saveStr("ssid", cfg.ssid);
   saveStr("pass", cfg.pass);
   lastDisconnectReason = 0;
-  WiFi.disconnect();
-  staBegin();
+  apManual = false;  // the hotspot's job is done once this connects
+  // Reconnect shortly, so an HTTP reply to a client on the old network still
+  // gets out before the connection drops.
+  reconnectPending = true;
+  reconnectAtMs = millis() + 500;
 }
 
 // --------------------------------------------------------------- LED/button
@@ -777,16 +797,14 @@ static void ledWrite(int r, int g, int b) {
 #endif
 }
 
-static bool buttonHeld __attribute__((unused)) = false;
-
 static void ledLoop() {
 #if LED_PIN >= 0
   static uint32_t last = 0xffffffff;
   uint32_t now = millis();
   uint32_t color = 0;  // 0xRRGGBB, kept dim
-  if (buttonHeld) {
-    color = 0x000030;
-  } else if (apActive) {
+  // Blue while the hotspot is needed: opened with the button, or Wi-Fi not
+  // connected yet. A hotspot left open briefly after setup shows normal state.
+  if (apActive && (apManual || !connected())) {
     color = ((now / (LED_RGB ? 500 : 125)) & 1) ? 0x000030 : 0;  // setup hotspot: blue blink
   } else if (!cfg.led) {
     color = 0;
@@ -817,16 +835,16 @@ static void buttonLoop() {
     if (stable) {
       pressedAt = now;
       longDone = false;
-    } else if (now - pressedAt < 1000) {  // 1-3 s: released while the LED showed blue, ignore
+    } else if (now - pressedAt < 1000) {  // 1-2 s presses do nothing
       setTx(!cfg.tx);
       Serial.printf("button: TX %s\n", cfg.tx ? "on" : "off");
     }
   }
-  if (stable && !longDone && now - pressedAt >= 3000) {
+  // The LED starts blinking blue as soon as this fires, so it can be released.
+  if (stable && !longDone && now - pressedAt >= 2000) {
     longDone = true;
     startAP(true);
   }
-  buttonHeld = stable && now - pressedAt >= 1000;
 #endif
 }
 
@@ -1253,6 +1271,7 @@ static String statusJson() {
   jsonKV(w, "ip", up ? WiFi.localIP().toString().c_str() : "");
   jsonKV(w, "rssi", up ? (long)WiFi.RSSI() : 0L);
   jsonKV(w, "ap", apActive);
+  jsonKV(w, "apManual", apManual);
   jsonKV(w, "apSsid", apSsid().c_str());
   jsonKV(w, "apIp", AP_IP.toString().c_str());
   w += '}';

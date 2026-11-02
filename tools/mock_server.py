@@ -77,6 +77,8 @@ class Device:
         self.ssid = "HomeNet" if configured else ""
         self.connected = configured
         self.ap = not configured
+        self.ap_manual = False
+        self.ap_close_at = None  # like the firmware: the setup hotspot closes 20 s after connecting
         self.time_valid = configured
         self.clock_offset = 0.0
         self.pending = None  # (ssid, ok, when)
@@ -95,6 +97,8 @@ class Device:
             self.connected = ok
             self.error = "" if ok else "wrong password?"
             if ok:
+                self.ap_manual = False
+                self.ap_close_at = time.time() + 20 if self.ap else None
                 self.time_valid = True
                 self.last_sync = time.time()
 
@@ -103,6 +107,8 @@ class Device:
 
     def status(self):
         self.step()
+        if self.ap_close_at and time.time() >= self.ap_close_at:
+            self.ap, self.ap_close_at = False, None
         st = self.station_info()
         zone = self.tz if self.tz and self.tz != "custom" else (st["tz"] if not self.tz else "UTC")
         now = self.now()
@@ -122,7 +128,8 @@ class Device:
             frame=FRAMES.get(self.station, FRAMES["jjy40"]) if transmitting else "",
             wifi=dict(ssid=self.ssid, connected=self.connected, connecting=bool(self.pending),
                       error="" if self.connected else self.error, ip="192.168.1.50" if self.connected else "",
-                      rssi=-58 if self.connected else 0, ap=self.ap, apSsid=self.host + "-setup", apIp="192.168.4.1"),
+                      rssi=-58 if self.connected else 0, ap=self.ap, apManual=self.ap_manual, apSsid=self.host + "-setup",
+                      apIp="192.168.4.1"),
             stations=[dict(s, shapes=SHAPES[s["key"]]) for s in STATIONS],
         )
 
@@ -215,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
             d.time_valid = True
             return self.json(d.status())
         if path == "/api/setup":
-            d.ap = True
+            d.ap, d.ap_manual = True, True
             return self.json(dict(ok=True))
         if path == "/api/reset":
             d.station, d.tz, d.tx, d.dst = "wwvb", "", True, 2
