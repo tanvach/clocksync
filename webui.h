@@ -58,6 +58,7 @@ button{font:inherit;color:var(--fg);background:transparent;border:1px solid var(
 button:hover{border-color:var(--mut)}
 button:disabled{opacity:.4}
 button.link{border:0;padding:0;color:var(--acc);border-radius:0}
+button[data-armed]{border-color:var(--bad);color:var(--bad)}
 .note{color:var(--mut);font-size:12px;margin:8px 0 0}
 .note:empty{display:none}
 .note.ok{color:var(--acc);font-size:14px}
@@ -481,14 +482,34 @@ $('cmdSend').onclick = function () {
 };
 $('cmd').onkeydown = function (e) { if (e.key === 'Enter') $('cmdSend').click(); };
 
-function post(path, question, msg, after) {
-  if (question && !confirm(question)) return;
+function post(path, msg, after) {
   api(path, {}).then(function (j) { toast(msg); if (after) after(j); }).catch(function (e) { toast(e.message); });
 }
-$('reboot').onclick = function () { post('/api/reboot', 'Restart?', 'Restarting…'); };
-$('setupAp').onclick = function () { post('/api/setup', null, 'Setup hotspot on', refresh); };
-$('reset').onclick = function () { post('/api/reset', 'Reset station, zone and radio settings? Wi-Fi is kept.', 'Settings reset', render); };
-$('forget').onclick = function () { post('/api/forget', 'Forget Wi-Fi and restart into setup?', 'Restarting…'); };
+// Destructive buttons need a second tap. (Phones' captive-portal browsers
+// often block confirm(), which made these buttons silently do nothing.)
+function confirmTap(btn, ask, action) {
+  return function () {
+    if (btn.dataset.armed) {
+      clearTimeout(btn.timer);
+      delete btn.dataset.armed;
+      btn.textContent = btn.dataset.label;
+      action();
+      return;
+    }
+    btn.dataset.label = btn.textContent;
+    btn.dataset.armed = '1';
+    btn.textContent = ask;
+    btn.timer = setTimeout(function () { delete btn.dataset.armed; btn.textContent = btn.dataset.label; }, 4000);
+  };
+}
+$('reboot').onclick = confirmTap($('reboot'), 'Tap again to restart', function () { post('/api/reboot', 'Restarting…'); });
+$('setupAp').onclick = function () { post('/api/setup', 'Setup hotspot on', refresh); };
+$('reset').onclick = confirmTap($('reset'), 'Tap again to reset', function () {
+  post('/api/reset', 'Station, zone and radio settings reset; Wi-Fi kept', render);
+});
+$('forget').onclick = confirmTap($('forget'), 'Tap again to forget Wi-Fi', function () {
+  post('/api/forget', 'Wi-Fi forgotten. Restarting into the setup hotspot…');
+});
 
 document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(); });
 setInterval(tick, 100);
