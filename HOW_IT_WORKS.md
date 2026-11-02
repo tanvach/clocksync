@@ -10,7 +10,7 @@ The frame encoders live in [`timecode.cpp`](./timecode.cpp), which has no Arduin
 The ESP32 generates the Low Frequency (LF) carrier using the `LEDC` (LED Control) peripheral.
 *   **Peripheral**: `LEDC_TIMER_0`, `LEDC_CHANNEL_0`, low-speed mode (available on every ESP32 variant).
 *   **Frequency**: 40 kHz, 60 kHz, 68.5 kHz, or 77.5 kHz, set from the selected station each time the carrier starts. (v1.x always ran at 60 kHz because the per-station frequency was never applied.)
-*   **Resolution**: 5-bit duty resolution. The LEDC clock divider has 8 fractional bits, so fewer duty bits leave a finer divider: at 5 bits every carrier lands within ~30 ppm of nominal (60 kHz → 59 998 Hz, 77.5 kHz → 77 500.6 Hz), while 8 bits gave errors up to ~370 ppm. Receivers use narrow crystal filters, so this matters for range.
+*   **Resolution**: 5-bit duty resolution. The LEDC clock divider has 8 fractional bits, so fewer duty bits leave a finer divider: at 5 bits every carrier lands within ~35 ppm of nominal (60 kHz → 59 998 Hz, 77.5 kHz → 77 500.6 Hz), while 8 bits gave errors up to ~370 ppm. Receivers use narrow crystal filters, so this matters for range.
 
 ### Amplitude Modulation (AM)
 The system simulates AM by switching the PWM duty cycle of the carrier.
@@ -251,4 +251,15 @@ MSF parity is **odd**: the parity bit makes the number of ones in its field odd.
 `make -C test` builds and runs two host-side test programs:
 
 *   **`test_timecode`** checks hand-derived golden frames for JJY, WWVB, DCF77 and MSF; decodes about 3 600 encoded minutes per station across 2026-2028 (plus New Year, leap day and DST-change edges) with decoders written independently from the specs; checks WWVB DST bits around every 2026 US transition, the DCF77 A1 and MSF 53B warning windows, and that BSF/BPC output matches the v1.3 code exactly.
-*   **`test_tzdata`** checks that every POSIX rule in `tzdata.h` gives the same UTC offset and DST flag as the host's zoneinfo database, hour by hour, for three years.
+*   **`test_tzdata`** checks that every POSIX rule in `tzdata.h` gives the same UTC offset and DST flag as the host's zoneinfo database, hour by hour, for three years. It skips that comparison when the host's tzdata version differs from the table's.
+
+`python3 tools/device_test.py <host>` runs end-to-end checks against a real device: NTP and clock agreement, the WWVB frame on air decoded against the current UTC minute, API guards and validation, and the carrier frequency for every station as read back from the LEDC registers. On an M5Stack Atom Lite (v2.0.0, core 3.3.5) the readbacks were:
+
+| Station | Nominal | LEDC | Error |
+| :--- | :--- | :--- | :--- |
+| JJY 40 kHz | 40 000 Hz | 40 000 Hz | 0 ppm |
+| JJY 60, WWVB, MSF | 60 000 Hz | 59 998 Hz | −33 ppm |
+| BPC | 68 500 Hz | 68 500 Hz | 0 ppm |
+| DCF77, BSF | 77 500 Hz | 77 501 Hz | +13 ppm |
+
+v1.x configured every station for 60 kHz, which its 8-bit resolution turned into about 60 015 Hz (+250 ppm).
