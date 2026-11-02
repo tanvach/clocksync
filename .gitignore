@@ -6,9 +6,15 @@ secrets.h
 
 # Arduino/PlatformIO build artifacts
 build/
+.build/
 .pio/
 .pioenvs/
 .piolibdeps/
+
+# Host test binaries
+test/test_timecode
+test/test_tzdata
+__pycache__/
 
 # IDE/editor
 .vscode/
@@ -23,15 +29,6 @@ build/
 # Misc
 *.log
 *.bak
-# Local secrets (WiFi credentials)
-secrets.h
 
-# Build artifacts (common for Arduino/ESP)
-*.bin
-*.elf
-*.map
-*.pio
-.build/
-.DS_Store
-
-
+# Browser installer build output
+_site/

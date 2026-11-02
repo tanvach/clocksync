@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>clocksync installer</title>
+<!-- Template: tools/build_installer.sh fills in __VERSION__ and adds boards.json and firmware/. -->
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+:root{color-scheme:light dark;--bg:#f7f7f5;--fg:#111214;--mut:#8a8d93;--line:#e3e3df;--acc:#0b8a55;--on-acc:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0c0e;--fg:#ecedee;--mut:#71757c;--line:#1e2126;--acc:#4ff0a0;--on-acc:#06130c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:560px;margin:0 auto;padding:22px 20px 60px}
+header{display:flex;justify-content:space-between;align-items:baseline}
+.brand{font-weight:600}
+.brand span{color:var(--mut);font-weight:400;margin-left:6px;font-size:12px}
+a{color:var(--acc);text-decoration:none}
+h1{font:500 clamp(34px,8vw,48px)/1.1 ui-monospace,"SF Mono",Menlo,Consolas,monospace;letter-spacing:-.03em;margin:56px 0 10px}
+h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:var(--mut);margin:36px 0 8px}
+p{margin:8px 0}
+.mut,.note{color:var(--mut)}
+.note{font-size:13px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:14px;min-height:46px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+select{font:inherit;color:inherit;background:transparent;border:0;padding:8px 0;text-align:right;text-align-last:right;cursor:pointer;outline:none;flex:1;min-width:0}
+select option{background:var(--bg);color:var(--fg)}
+.go{font:inherit;font-weight:600;background:var(--acc);color:var(--on-acc);border:0;border-radius:999px;padding:10px 22px;cursor:pointer;margin:8px 0}
+esp-web-install-button [slot=unsupported],esp-web-install-button [slot=not-allowed]{display:block;color:#d2383e}
+b{font-weight:600}
+</style>
+</head>
+<body>
+<main>
+<header><div class="brand">clocksync<span>v__VERSION__</span></div><a href="https://github.com/tanvach/clocksync">GitHub</a></header>
+
+<h1>Install from the browser</h1>
+<p class="mut">Chrome or Edge on a computer. No software to install.</p>
+
+<h2>1 · Board</h2>
+<div class="row"><label for="board">Board</label><select id="board"></select></div>
+
+<h2>2 · Install</h2>
+<p>Connect the board with a USB data cable, then:</p>
+<esp-web-install-button id="install">
+ <button slot="activate" class="go">Install clocksync</button>
+ <span slot="unsupported">This browser can't reach USB devices. Use Chrome or Edge on a computer.</span>
+ <span slot="not-allowed">The installer only works on an https page.</span>
+</esp-web-install-button>
+<p class="note">Updating? Leave “Erase device” unticked to keep Wi-Fi and settings.</p>
+<p class="note">Board not detected? Hold its BOOT button while plugging it in, then try again.</p>
+
+<h2>3 · Set up</h2>
+<p>From your phone, join the Wi-Fi network <b>clocksync-setup</b>. In the page that opens, pick your network and your clock's station. After that the clock is at <b>clocksync.local</b>.</p>
+
+<h2>Other flashers</h2>
+<p class="note">Images for esptool and similar tools: <span id="downloads"></span>. Write the app image at 0x10000 to keep settings, or the full image at 0x0 for a clean install.</p>
+</main>
+<script>
+(function () {
+  var sel = document.getElementById('board'), btn = document.getElementById('install');
+  function remember(v) { try { if (v) localStorage.setItem('cs_board', v); return localStorage.getItem('cs_board'); } catch (e) { return null; } }
+  function apply() {
+    var id = sel.value, base = 'downloads/clocksync-__VERSION__-' + id;
+    btn.setAttribute('manifest', 'firmware/' + id + '/manifest.json');
+    document.getElementById('downloads').innerHTML =
+      '<a href="' + base + '-app.bin" download>app</a> · <a href="' + base + '-full.bin" download>full</a>';
+    remember(id);
+  }
+  fetch('boards.json').then(function (r) { return r.json(); }).then(function (boards) {
+    sel.innerHTML = boards.map(function (b) {
+      return '<option value="' + b.id + '">' + b.label + '</option>';
+    }).join('');
+    var saved = remember();
+    if (saved && boards.some(function (b) { return b.id === saved; })) sel.value = saved;
+    sel.onchange = apply;
+    apply();
+  });
+})();
+</script>
+</body>
+</html>
