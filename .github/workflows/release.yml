@@ -1,0 +1,66 @@
+# Builds the firmware for every board. Pushes to master publish the browser
+# installer to GitHub Pages; v* tags attach the images to a GitHub release.
+# (The default github-pages environment only accepts deploys from the
+# default branch, so tags don't deploy.)
+#
+# One-time setup: repository Settings -> Pages -> Source: "GitHub Actions".
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  ESP32_CORE: "3.3.5"
+  ESP32_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tests
+        run: make -C test
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX"
+          arduino-cli core install "esp32:esp32@$ESP32_CORE" --additional-urls "$ESP32_INDEX"
+
+      - name: Build firmware and installer site
+        run: tools/build_installer.sh _site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Attach images to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _site/downloads/*.bin
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -2,1650 +2,1600 @@
 // clocksync.ino - ESP32 fake radio clock station
 //
 // Forked from 'nisejjy' by SASAKI Taroh (tarohs).
-// Maintained by Tanvach.
+// Maintained by Tanvach. Wi-Fi setup hotspot and runtime time zone ideas
+// from the Rmni2/clocksync-esp32-c3 fork.
 //
-// See README.md for usage, hardware setup, and attribution.
-// See HOW_IT_WORKS.md for technical details on signal encoding.
+// Compile and upload: no source changes are needed. On first boot the device
+// opens a "clocksync-setup" Wi-Fi hotspot; join it and pick your network,
+// station and time zone in the page that opens.
+//
+// See README.md for usage and HOW_IT_WORKS.md for the signal details.
 //
 
-#define VERSION "1.3.1"
-
-
-//...................................................................
-// hardware config
-// Radio output pin (default 32). Grove pins 25 or 26 also work if you prefer using the Grove port;
-// avoid them if you need I2C on SDA/SCL. Stay within isSafeAtomPin().
-#define PIN_RADIO (32)
-// note: {pin -> 330ohm -> 30cm loop antenna -> GND} works
-//     (33mW, but detuned length (super shorten), only very weak radiowave emitted).
-#define PIN_BUZZ (-1)   // no onboard buzzer on M5 Atom Lite
-#define PIN_LED (-1)    // use M5 Atom RGB LED instead
-// Optional measurement input (jumper to radio pin for self-test)
-// Default: GPIO33.
-#define PIN_MEAS (33)
-// Optional button pin (default 39 for M5 Atom Lite)
-#define PIN_BUTTON (39)
+#define VERSION "2.0.0"
 
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <WebServer.h>
-// M5 Atom Lite support (RGB LED, button, etc.)
-#include <M5Atom.h>
-// Drive strength configuration for safe antenna drive
-#include "driver/gpio.h"
-// High-resolution timer for precise tick scheduling
-#include "esp_timer.h"
-// ESP-IDF LEDC driver
-#include "driver/ledc.h"
+#include <DNSServer.h>
 #include <Preferences.h>
-#define DEVICENAME "clocksync"
+#include <sys/time.h>
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_timer.h"
+#include "esp_sntp.h"
 
-// WiFi credentials are sourced from secrets.h (gitignored). An example
-// file is provided as secrets_example.h. If secrets.h is missing, the
-// example is used so the sketch still builds.
+#include "board.h"
+#include "timecode.h"
+#include "tzdata.h"
+#include "webui.h"
+
+// Optional build-time defaults (Wi-Fi, station, ...): copy secrets_example.h
+// to secrets.h. Everything can also be set from the web UI instead.
 #if __has_include("secrets.h")
 #include "secrets.h"
-#elif __has_include("secrets_example.h")
-#include "secrets_example.h"
-#else
-#error "Missing secrets.h or secrets_example.h"
+#endif
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef DEFAULT_STATION
+#define DEFAULT_STATION TC_WWVB
+#endif
+#ifndef DEFAULT_HOSTNAME
+#define DEFAULT_HOSTNAME "clocksync"
+#endif
+#ifndef DEFAULT_NTP_SERVER
+#define DEFAULT_NTP_SERVER "pool.ntp.org"
+#endif
+#ifndef AP_PASSWORD
+#define AP_PASSWORD ""  // the setup hotspot is open; use 8+ characters to protect it
 #endif
 
-char ssid[] = WIFI_SSID;
-char passwd[] = WIFI_PASS;
-// POSIX TZ string — set to your local timezone (see README for examples).
-// WWVB requires a US timezone for correct DST bits.
-// Find yours: tail -1 /etc/localtime (Mac/Linux) or see README
-#define TZ "PST8PDT,M3.2.0,M11.1.0"  // US Pacific; see README for other zones
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+#define rgbLedWrite neopixelWrite
+#endif
 
-// ------------------------------------------------------------------
-// Logging helpers (USB serial only; web UI shows status separately)
-#define LOG_PRINT(x) do { Serial.print(x); } while (0)
-#define LOG_PRINTLN(x) do { Serial.println(x); } while (0)
-#define LOG_PRINTF(fmt, ...) do { Serial.printf((fmt), ##__VA_ARGS__); } while (0)
+// Any time before this is "clock not set" (the ESP32 boots in 1970).
+static const time_t VALID_TIME = 1704067200;  // 2024-01-01
+static const IPAddress AP_IP(192, 168, 4, 1);
+static const uint32_t AP_AFTER_BOOT_MS = 20000;      // no Wi-Fi this long after boot: open hotspot
+static const uint32_t AP_AFTER_DROPOUT_MS = 300000;  // lost Wi-Fi this long: open hotspot
+static const uint32_t STA_RETRY_MS = 10000;          // reconnect attempts
+static const uint32_t STA_RETRY_AP_MS = 30000;       // ... while the setup hotspot is up
+static const uint32_t STA_RETRY_BUSY_MS = 180000;    // ... while someone is connected to it
+static const size_t HOST_MAX = 26;                   // "<name>-setup" must fit a 32-byte SSID
+static const int SAFE_PIN_LIST[] = SAFE_PINS;
 
-// Minimal HTTP server for control/status
-WebServer server(80);
+// ------------------------------------------------------------------ settings
 
-//...................................................................
-// station specs
-//
-#define SN_JJY_E (0)  // JJY Fukushima Japan
-#define SN_JJY_W (1)  // JJY Fukuoka Japan
-#define SN_WWVB (2)   // WWVB US
-#define SN_DCF77 (3)  // DCF77 Germany
-#define SN_BSF (4)    // BSF Taiwan
-#define SN_MSF (5)    // MSF UK
-#define SN_BPC (6)    // BPC China
-
-#define SN_DEFAULT (SN_WWVB)
-
-int st_cycle2[] = {
-  // interrupt cycle, KHz: double of station freq
-  80,   // 40KHz JJY-E
-  120,  // 60KHz JJY-W
-  120,  // 60KHz WWVB
-  155,  // 77.5KHz DCF77
-  155,  // 77.5KHz BSF
-  120,  // 60KHz MSF
-  137   // 68.5KHz BPC
+struct Settings {
+  int station;
+  bool tx;
+  int pin;
+  int drive;  // GPIO drive strength 0..3
+  bool led;
+  bool ntp;
+  int dstMode;  // TC_DST_*
+  char ssid[33];
+  char pass[64];
+  char tzName[48];  // "" = station's own zone, "custom" = tzPosix, else IANA name
+  char tzPosix[64];
+  char ntpServer[64];
+  char host[32];
 };
 
-// interrupt cycle to makeup radio wave, buzzer (500Hz = 1KHz cycle):
-// peripheral freq == 80MHz
-//    ex. radio freq 40KHz: intr 80KHz: 80KHz / 80MHz => 1/1000 (1/tm0cycle)
-//    buzz cycle: 1KHz / 80KHz 1/80 (1/radiodiv)
-int tm0cycle;
-#define TM0RES (1)
-int radiodiv;
+static Settings cfg;
+static Preferences prefs;
 
-// TM0RES (interrupt counter), AMPDIV (buzz cycle(1000) / subsec(10)), SSECDIV (subsec / sec)
-// don't depend on station specs.
-#define AMPDIV (100)  // 1KHz / 100 => 10Hz, amplitude may change every 0.1 seconds
-#define SSECDIV (10)  // 10Hz / 10 => 1Hz, clock ticks
+// ------------------------------------------------------------------- globals
 
-// enum symbols
-#define SP_0 (0)
-#define SP_1 (1)
-#define SP_M (2)
-#define SP_P0 (SP_1)  // for MSF
-#define SP_P1 (3)     // for MSF
-/*#define SP_M0 (3) // for HBG
-#define SP_M00 (4) // for HBG
-#define SP_M000 (5) // for HBG
- */
-#define SP_2 (2)   // for BSF/BPC
-#define SP_3 (3)   // for BSF/BPC
-#define SP_M4 (4)  // for BSF/BPC
-#define SP_MAX (SP_M4)
-//
-// bits_STATION[] => *bits60: 60 second symbol buffers, initialized with patterns
-// sp_STATION[] => *secpattern: 0.1sec term pattern in one second, for each symbol
-// * note: when sp_STATION[n * 10], secpattern[] is like 2-dim array secpattern[n][10].
-//
-// JJY & WWVB  *note: comment is the format of JJY.
-int8_t bits_jjy[] = {
-  // 60bit transmitted frame, of {SP_0, SP_1, SP_M}
-  SP_M, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M,  // (M), MIN10[3], 0, MIN1[4], (M)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M,  // 0, 0, HOUR10[2], 0, HOUR1[4], (M)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M,  // 0, 0, DOY100[2], DOY10[4], (M)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M,  // DOY1[4], 0, 0, PA1, PA2, 0, (M)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M,  // 0, YEAR[8], (M)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M   // DOW[3], LS1, LS2, 0, 0, 0, 0, (M)
-};
-// *note: if summer time, set bit 57/58 (WWVB) (bit 38/40 (JJY, in future))
-int8_t sp_jjy[] = {
-  // in (0, 1), [SP_x][amplitude_for_0.1sec_term_in_second]
-  1, 1, 1, 1, 1, 1, 1, 1, 0, 0,  // SP_0
-  1, 1, 1, 1, 1, 0, 0, 0, 0, 0,  // SP_1
-  1, 1, 0, 0, 0, 0, 0, 0, 0, 0   // SP_M
-};
-int8_t sp_wwvb[] = {
-  // in (0, 1), [SP_x][amplitude_for_0.1sec_term_in_second]
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_0
-  0, 0, 0, 0, 0, 1, 1, 1, 1, 1,  // SP_1
-  0, 0, 0, 0, 0, 0, 0, 0, 1, 1   // SP_M
-};
+static WebServer server(80);
+static DNSServer dns;
 
-// DCF77 encoding is LSB->MSB. //HBG *note: [0] is changed depending on DCF/HBG (also min/hour).
-int8_t bits_dcf[] = {
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // 0, reserved[9]
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_1, SP_0,  // reserved[5], 0, 0, (0, 1)(MEZ), 0
-  SP_1, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // 1, MIN1[4], MIN10[3], P1, (1->)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // HOUR1[4], HOUR10[2], P2, D1[4]
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // D10[2], DOW[3], M1[4], M10[1]
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M   // Y1[4], Y10[4], P3, (M)
-};
-int8_t sp_dcf[] = {
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_0
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_1
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1   // SP_M
-};
-/*
-int8_t sp_hbg[] = {
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1,   // SP_0
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,   // SP_1
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1,   // SP_M
-  0, 1, 0, 1, 1, 1, 1, 1, 1, 1,   // SP_M0    // 00sec
-  0, 1, 0, 1, 0, 1, 1, 1, 1, 1,   // SP_M00   // 00sec at 00min
-  0, 1, 0, 1, 0, 1, 0, 1, 1, 1    // SP_M000  // 00sec at 00/12 hour 00min
-};
-*/
-
-// BSF: quad encoding.
-int8_t bits_bsf[] = {
-  SP_M4, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M4,
-  SP_1, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // 1, min[3], hour[2.5], P1[.5],
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_M4  // DOM[2.5], DOW[2.5], mon[2],
-                                                               // year[3.5], P2[.5], 0, 0, M
-};
-int8_t sp_bsf[] = {
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_0
-  0, 0, 0, 0, 1, 1, 1, 1, 1, 1,  // SP_1
-  0, 0, 0, 0, 0, 0, 0, 0, 1, 1,  // SP_2
-  0, 0, 0, 0, 0, 0, 1, 1, 1, 1,  // SP_3
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1   // SP_M4
-};
-
-// MSF has 4 patterns.
-int8_t bits_msf[] = {
-  SP_M, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_1, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,
-  SP_0, SP_0, SP_0, SP_P0, SP_P0, SP_P0, SP_P0, SP_P0, SP_P0, SP_0
-};
-int8_t sp_msf[] = {
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_0
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_1/SP_P0 (parity 0)
-  0, 0, 0, 0, 0, 1, 1, 1, 1, 1,  // SP_M
-  0, 0, 0, 1, 1, 1, 1, 1, 1, 1   // SP_P1 (parity 1)
-};
-
-// BPC: quadary and has 5 patterns.
-int8_t bits_bpc[] = {
-  SP_M4, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // (B), P1, P2, h[2], m[3], DOW[2]
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,   // P3, D[3], M[2], Y[3], P4
-  SP_M4, SP_1, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // P1: 0, 1, 2 for 00-19, -39, -59s
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,   // P2: 0, P3: AM/PM(0/2)+par<hmDOW>
-  SP_M4, SP_2, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0,  // P4: par<DMY> (0/1)
-  SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0, SP_0
-};
-int8_t sp_bpc[] = {
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_0
-  0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  // SP_1
-  0, 0, 0, 1, 1, 1, 1, 1, 1, 1,  // SP_2
-  0, 0, 0, 0, 1, 1, 1, 1, 1, 1,  // SP_3
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // SP_M4
-};
-
-// func for makeup patterns
-void mb_jjy(void);   // JJY-E, JJY-W
-void mb_wwvb(void);  // WWVB
-void mb_dcf(void);   // DCF77
-void mb_bsf(void);   // BSF
-void mb_msf(void);   // MSF
-void mb_bpc(void);   // BPC
-
-int8_t *st_bits[] = { bits_jjy, bits_jjy, bits_jjy, bits_dcf, bits_bsf, bits_msf, bits_bpc };
-int8_t *bits60;
-int8_t *st_sp[] = { sp_jjy, sp_jjy, sp_wwvb, sp_dcf, sp_bsf, sp_msf, sp_bpc };
-int8_t *secpattern;
-void (*st_makebits[])(void) = { mb_jjy, mb_jjy, mb_wwvb, mb_dcf, mb_bsf, mb_msf, mb_bpc };
-void (*makebitpattern)(void);
-const char *stationNames[] = {
-  "JJY_E (40 kHz)",
-  "JJY_W (60 kHz)",
-  "WWVB (60 kHz)",
-  "DCF77 (77.5 kHz)",
-  "BSF (77.5 kHz)",
-  "MSF (60 kHz)",
-  "BPC (68.5 kHz)"
-};
-const char stationCmds[] = { 'j', 'k', 'w', 'd', 't', 'm', 'c' };
-
-//...................................................................
-// globals
-hw_timer_t *tm0 = NULL;
-volatile SemaphoreHandle_t timerSemaphore;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint32_t buzzup = 0;  // inc if buzz cycle (/2) passed
-int istimerstarted = 0;
-// TX enable/disable (controls whether the carrier + modulation scheduler are running)
-int txEnabled = 1;  // 1=enabled, 0=disabled
-
-int radioc = 0;  // 0..(RADIODIV - 1)
-int ampc = 0;    // 0..(AMPDIV - 1)
-int tssec = 0;   // 0..(SSECDIV - 1)
-
-// Radio output GPIO (runtime configurable)
-volatile int pinRadio = PIN_RADIO;
-// GPIO drive strength (0=weakest..3=strongest)
-int driveStrength = GPIO_DRIVE_CAP_2;
-
-int currentStation = SN_DEFAULT;
-
-int ntpsync = 1;
-time_t now;
-struct tm nowtm;
-//int tsec, tmin, thour,    // initial values for date/time
-//    tday, tmon, tyear; // tyear: lower 2 digits of 20xx
-//int tdoy, tdow; // day of year (1-365/366), day of week (0-6)
-int radioout = 0,  // pin output values
-  buzzout = 0;
-int ampmod;                        // 1 if radio out is active (vibrating), 0 if reducted,
-                                   // at cuttent subsecond-second frame for current date-time
-int buzzsw = 0;                    // sound on/off
-volatile int overrideCarrier = 0;  // 1: force continuous carrier for self-test
-volatile uint32_t measCount = 0;   // edge counter for self-test
-int wwvbEncodeNextMinute = 0;      // 1: encode next minute (WWVB compatibility)
-int dstOverride = 2;               // 0=standard,1=DST,2=auto(nowtm.tm_isdst)
-
-Preferences prefs;
-// Last command response to surface in web UI (optional detail)
-String lastCmdResp;
-int ledEnabled = 1;                // 0=off, 1=on (M5 LED or PIN_LED)
-static int lastLedState = -1;      // -1 unknown, 0 off, 1 on, -2 disabled
-
-// WiFi Reconnect Tracking
-static unsigned long lastWiFiCheckTime = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 60000; // 60 seconds
-
-// LEDC carrier generation (single output pin)
-
-// LEDC carrier generation (single output pin)
+// radio
 static const ledc_mode_t LEDC_MODE = LEDC_LOW_SPEED_MODE;
-static const ledc_timer_t LEDC_TIMERIDX = LEDC_TIMER_0;
-static const ledc_channel_t LEDC_CHANNEL_ID = LEDC_CHANNEL_0;
-static const int LEDC_RES_BITS = 8;  // 8-bit duty resolution
-static uint32_t carrierHz = 60000;   // updated per station
-static int dutyHigh = 128;           // ~50% duty (max fundamental)
-static int dutyLow = 14;             // ~5.5% duty (~17% amplitude)
+static const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+static const ledc_channel_t LEDC_CHANNEL = LEDC_CHANNEL_0;
+// 5-bit resolution keeps the LEDC divider fine enough for a carrier within
+// ~30 ppm of nominal (8 bits gives up to ~370 ppm error).
+static const int LEDC_BITS = 5;
+static const uint32_t DUTY_HIGH = 16;  // 50 %: strongest fundamental
+static const uint32_t DUTY_LOW = 2;    // 6.25 %: fundamental at ~20 % (-14 dB)
+static SemaphoreHandle_t radioMutex;
+static esp_timer_handle_t tickTimer;
+static volatile bool radioOn = false;
+static int radioStation = -1;
+static int radioPin = -1;
+static volatile bool forceCarrier = false;  // self-test
+static volatile int carrierHigh = 0;
+static uint8_t frame[60];
+static time_t frameMinute = -1;
+static volatile bool frameDirty = true;
+static volatile uint32_t frameCount = 0;
 
-// esp_timer for 100ms aligned ticks
-static esp_timer_handle_t tick_timer = NULL;
-static esp_timer_handle_t align_timer = NULL;
-static volatile int secBoundaryFlag = 0;  // set at each second boundary
-static volatile int tickFlag = 0;         // set each 100ms tick
-static volatile int currentSecond = 0;    // updated at second boundary
+// network
+static bool apActive = false;
+static bool apManual = false;
+static uint32_t apStartedMs = 0;
+static bool wasConnected = false;
+static bool everConnected = false;
+static uint32_t connectedSinceMs = 0;
+static uint32_t lastConnectedMs = 0;
+static uint32_t lastStaAttemptMs = 0;
+static uint32_t retryNotBeforeMs = 0;  // a Wi-Fi scan holds off reconnects
+static uint32_t apFailedMs = 0;
+static volatile int lastDisconnectReason = 0;
+static bool mdnsStarted = false;
+static char hostActive[32];  // name in use since boot; a new one applies after restart
+static bool ntpRunning = false;
+// lwIP keeps a pointer to the server name and esp_sntp_stop() finishes
+// asynchronously, so alternate buffers instead of overwriting the live one.
+static char ntpServerBufs[2][64];
+static int ntpServerBuf = 0;
+static volatile time_t lastNtpSync = 0;
 
-// WWVB minute bits prepared like txtempus (bit 59 is first second)
-static uint64_t wwvb_bits = 0;
-static time_t wwvb_minute_prepared = (time_t)-1;
+// misc
+static bool rebootPending = false;
+static uint32_t rebootAtMs = 0;
 
-// extern
-void IRAM_ATTR onTimer(void);
-void setup(void);
-void loop(void);
-void starttimer(void);
-void stoptimer(void);
-void setTxState(int enable);
-void ampchange(void);
-void setstation(int station);
-void binarize(int v, int pos, int len);
-void bcdize(int v, int pos, int len);
-void rbinarize(int v, int pos, int len);
-void rbcdize(int v, int pos, int len);
-void quadize(int v, int pos, int len);
-int parity(int pos, int len);
-int qparity(int pos, int len);
-void setlocaltime(void);
-void getlocaltime(void);
-//void setdoydow(void);
-//int julian(int y, int m, int d);
-//void incday(void); // for DCF77
-int docmd(char *buf);
-int a2toi(char *chp);
-void printbits60(void);
-void ntpstart(void);
-void ntpstop(void);
-int isSafeAtomPin(int p);
-void printhelp(void);
-void IRAM_ATTR meas_isr(void);
-int isUSDSTPending2h(void);
-int getDSTFlag(void);
+// ------------------------------------------------------------------- helpers
 
-
-// LEDC/timer helpers
-void setupCarrierLEDC(void);
-void setCarrierPowerLevel(int highPower);
-void scheduleAlignedTicks(void);
-void IRAM_ATTR onAlignedStart(void *arg);
-void IRAM_ATTR onTick100ms(void *arg);
-void prepareWWVBMinuteBits(time_t minuteStartUTC);
-  // Web server helpers
-  void setupWebServer(void);
-  String generateStatusText(void);
-  void handleRoot(void);
-  void handleStatus(void);
-  void handleCmd(void);
-  void saveSettings(void);
-  void loadSettings(void);
-  void applyDefaultSettings(void);
-// GPIO helpers
-int clampDriveCap(int cap);
-void applyDriveStrength(void);
-
-//...................................................................
-// intr handler:
-//   this routine is called once every 1/2f sec (where f is radio freq).
-//   - reverse radio output pin if modulation flag "ampmod" == 1,
-//   - count up "radioc", if exceeds "radiodev" then
-//     turn on buzzer flag "buzzup"; the "buzzup" is set once in 1/1000sec
-//     on every frequency of the station (so "radiodev" should be set
-//     propery depending to the intr cycle "tm0cycle" of the station).
-void IRAM_ATTR onTimer(void) {
-  // no-op: LEDC-based carrier; ISR not used
-  return;
+static bool timeValid() {
+  return time(NULL) >= VALID_TIME;
 }
 
-//...................................................................
-void setup(void) {
-
-  Serial.begin(115200);
-  delay(100);
-  LOG_PRINT("started...\n");
-
-  // Initialize M5 Atom Lite (Serial, no I2C, Display/LED enabled)
-  M5.begin(true, false, true);
-  // Ensure onboard RGB LED is off initially
-  M5.dis.drawpix(0, 0x000000);
-
-  LOG_PRINTLN("\nUSB serial control ready (115200 bps). Type 'h' + Enter for help.");
-
-  // HTTP server provides control/status.
-
-  // Credentials are compiled in; no need to persist them to NVS flash.
-  WiFi.persistent(false);
-  // Ensure max performance for network services
-  WiFi.setSleep(false);
-
-  // Load persisted settings before initializing subsystems
-  loadSettings();
-  if (ntpsync) {
-    ntpstart();
+static bool pinAllowed(int p) {
+  for (int s : SAFE_PIN_LIST) {
+    if (s == p) return true;
   }
+  return false;
+}
 
-  // Explicitly start mDNS after WiFi is connected (ntpstart connects WiFi)
-  if (WiFi.status() == WL_CONNECTED) {
-    if (MDNS.begin(DEVICENAME)) {
-      LOG_PRINTLN("mDNS responder started: " DEVICENAME ".local");
+static bool connected() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static const char *effectiveTzName() {
+  if (cfg.tzName[0] == 0) return tc_stations[cfg.station].native_tz;
+  return cfg.tzName;
+}
+
+static const char *effectivePosix() {
+  if (cfg.tzName[0] == 0) return tc_stations[cfg.station].native_posix;
+  return cfg.tzPosix;
+}
+
+// Find the POSIX rule for an IANA zone name in the built-in table.
+static bool tzLookup(const char *name, char *out, size_t outLen) {
+  size_t len = strlen(name);
+  const char *p = TZDATA;
+  while (*p) {
+    const char *tab = strchr(p, '\t');
+    const char *nl = strchr(tab, '\n');
+    if ((size_t)(tab - p) == len && strncmp(p, name, len) == 0) {
+      size_t n = nl - tab - 1;
+      if (n >= outLen) return false;
+      memcpy(out, tab + 1, n);
+      out[n] = 0;
+      return true;
     }
+    p = nl + 1;
   }
+  return false;
+}
 
-  // Start HTTP control/status server
-  setupWebServer();
-  // Prepare radio pin
-  pinMode(PIN_MEAS, INPUT_PULLDOWN);
-  pinMode(pinRadio, OUTPUT);
-  digitalWrite(pinRadio, LOW);
-  applyDriveStrength();
-  if (PIN_BUZZ >= 0) {
-    pinMode(PIN_BUZZ, OUTPUT);
-    digitalWrite(PIN_BUZZ, buzzout);
+// A POSIX TZ rule starts with a zone name (3+ letters or <...>) and an offset,
+// e.g. "JST-9" or "<+0330>-3:30". Anything else newlib silently treats as UTC.
+static bool validPosix(const char *s) {
+  size_t n = strlen(s);
+  if (n == 0 || n >= sizeof(cfg.tzPosix)) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (s[i] < 0x21 || s[i] > 0x7e) return false;
   }
-  if (PIN_LED >= 0) {
-    if (ledEnabled) {
-      pinMode(PIN_LED, OUTPUT);
-      digitalWrite(PIN_LED, LOW);
-      lastLedState = 0;
-    } else {
-      pinMode(PIN_LED, INPUT);  // tri-state to avoid any drive
-      lastLedState = -2;
-    }
+  size_t i = 0;
+  if (s[0] == '<') {
+    const char *close = strchr(s, '>');
+    if (!close) return false;
+    i = close - s + 1;
   } else {
-    if (ledEnabled) {
-      // leave off initially; will blink based on ampmod in loop()
-      M5.dis.drawpix(0, 0x000000);
-      lastLedState = 0;
-    } else {
-      // ensure fully off and no further updates in loop when disabled
-      M5.dis.drawpix(0, 0x000000);
-      lastLedState = -2;
-    }
+    while (isalpha((unsigned char)s[i])) i++;
+    if (i < 3) return false;
   }
-  //  setdoydow();
-  setstation(currentStation);  // will start carrier only if txEnabled
-  LOG_PRINT(txEnabled ? "radio started.\n" : "radio disabled (TX off).\n");
+  if (s[i] == '+' || s[i] == '-') i++;
+  return isdigit((unsigned char)s[i]);
 }
 
-
-void loop() {
-  int buzzup2 = 0;  // legacy
-  static char buf[128];
-  static int bufp = 0;
-  static char usb[128];
-  static int usbp = 0;
-
-  // Non-blocking WiFi reconnect check
-  if (ntpsync) {
-    unsigned long currentMillis = millis();
-    if (WiFi.status() == WL_CONNECTED) {
-      lastWiFiCheckTime = currentMillis; // Constantly reset while connected
-    } else if (currentMillis - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
-      lastWiFiCheckTime = currentMillis;
-      LOG_PRINTLN("WiFi disconnected. Attempting reconnect...");
-      WiFi.disconnect();
-      WiFi.begin(ssid, passwd); // Re-initiate connection
-    }
+static bool validHostname(const char *s) {
+  size_t n = strlen(s);
+  if (n == 0 || n > HOST_MAX || s[0] == '-' || s[n - 1] == '-') return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
   }
-
-  // Update M5 state (button, etc.)
-  M5.update();
-  if (M5.Btn.wasPressed()) {
-    setTxState(!txEnabled);
-    saveSettings();
-    LOG_PRINTF("Button: TX %s\n", txEnabled ? "enabled" : "disabled");
-  }
-  // For generic ESP32 (if M5Atom lib excluded):
-  // if (digitalRead(PIN_BUTTON) == LOW) { delay(50); if(digitalRead(PIN_BUTTON)==LOW) { ... } }
-
-  // Aligned second boundary
-  if (secBoundaryFlag) {
-    secBoundaryFlag = 0;
-    int lastmin = nowtm.tm_min;
-    getlocaltime();
-    currentSecond = nowtm.tm_sec;
-    if (lastmin != nowtm.tm_min) {
-      if (currentStation != SN_WWVB) {
-        makebitpattern();
-        printbits60();
-      }
-    }
-    if (currentStation == SN_WWVB) {
-      time_t tnow;
-      time(&tnow);
-      time_t minuteStartUTC = tnow - (tnow % 60);
-      if (wwvb_minute_prepared != minuteStartUTC) {
-        prepareWWVBMinuteBits(minuteStartUTC);
-        wwvb_minute_prepared = minuteStartUTC;
-      }
-    }
-    LOG_PRINTF("%d-%d-%d, %d(%d) %02d:%02d:%02d\n",
-               nowtm.tm_year + 1900, nowtm.tm_mon + 1, nowtm.tm_mday,
-               nowtm.tm_yday, nowtm.tm_wday,
-               nowtm.tm_hour, nowtm.tm_min, nowtm.tm_sec);
-  }
-
-  // 100ms tick: drive amplitude
-  if (tickFlag) {
-    tickFlag = 0;
-    int highPower = 1;
-    if (overrideCarrier) {
-      highPower = 1;
-    } else if (currentStation == SN_WWVB) {
-      int sec = currentSecond % 60;
-      int lowTicks;
-      if (sec == 0 || (sec % 10) == 9) {
-        lowTicks = 8;  // marker
-      } else {
-        int bit = (int)((wwvb_bits >> (59 - sec)) & 1ULL);
-        lowTicks = bit ? 5 : 2;
-      }
-      highPower = (tssec >= lowTicks) ? 1 : 0;
-    } else {
-      highPower = secpattern[bits60[nowtm.tm_sec] * 10 + tssec] ? 1 : 0;
-    }
-    ampmod = highPower;
-    setCarrierPowerLevel(ampmod);
-    if (ledEnabled) {
-      int desired = ampmod ? 1 : 0;
-      if (PIN_LED >= 0) {
-        if (lastLedState != desired) {
-          // ensure output mode when enabled
-          pinMode(PIN_LED, OUTPUT);
-          digitalWrite(PIN_LED, desired ? HIGH : LOW);
-          lastLedState = desired;
-        }
-      } else {
-        if (lastLedState != desired) {
-          M5.dis.drawpix(0, desired ? 0x10ff10 : 0x000000);
-          lastLedState = desired;
-        }
-      }
-    } else {
-      // Disable LED hardware completely; do this once
-      if (lastLedState != -2) {
-        if (PIN_LED >= 0) {
-          pinMode(PIN_LED, INPUT);
-        } else {
-          M5.dis.drawpix(0, 0x000000);
-        }
-        lastLedState = -2;
-      }
-    }
-    Serial.print(ampmod ? "~" : ".");
-  }
-  // Commands accepted via USB serial and HTTP
-  while (Serial.available()) {
-    usb[usbp] = Serial.read();
-    if (usb[usbp] == '\n' || usb[usbp] == '\r' || usbp == sizeof(usb) - 1) {
-      usb[usbp] = '\0';
-      docmd(usb);
-      usbp = 0;
-    } else {
-      usbp++;
-    }
-  }
-  // Handle HTTP requests quickly; non-blocking
-  server.handleClient();
-  delay(1);  // feed watchdog
+  return true;
 }
 
-
-//...................................................................
-
-
-//...................................................................
-void starttimer(void) {
-  if (istimerstarted) {
-    stoptimer();
+static bool validServer(const char *s) {
+  size_t n = strlen(s);
+  if (n == 0 || n >= sizeof(cfg.ntpServer)) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':')) return false;
   }
-  setupCarrierLEDC();
-  scheduleAlignedTicks();
-  LOG_PRINT("(re)started LEDC carrier + tick scheduler...\n");
-  istimerstarted = 1;
-  return;
+  return true;
 }
 
-void stoptimer(void) {
-  if (istimerstarted) {
-    if (align_timer) {
-      esp_timer_stop(align_timer);
+static void copyStr(char *dst, size_t len, const char *src) {
+  strncpy(dst, src, len - 1);
+  dst[len - 1] = 0;
+}
+
+static String fmtLocal(time_t t) {
+  struct tm lt;
+  localtime_r(&t, &lt);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &lt);
+  return String(buf);
+}
+
+// Seconds east of UTC at time t (newlib has no timegm or tm_gmtoff).
+static long utcOffsetAt(time_t t) {
+  struct tm lt, ut;
+  localtime_r(&t, &lt);
+  gmtime_r(&t, &ut);
+  long days = lt.tm_yday - ut.tm_yday;
+  if (lt.tm_year != ut.tm_year) days = lt.tm_year > ut.tm_year ? 1 : -1;
+  return days * 86400 + (lt.tm_hour - ut.tm_hour) * 3600L + (lt.tm_min - ut.tm_min) * 60L + (lt.tm_sec - ut.tm_sec);
+}
+
+static String ageText(time_t then) {
+  if (then == 0) return String("never");
+  long s = (long)(time(NULL) - then);
+  if (s < 0) s = 0;
+  if (s < 120) return String(s) + " s ago";
+  if (s < 7200) return String(s / 60) + " min ago";
+  return String(s / 3600) + " h ago";
+}
+
+// --------------------------------------------------------------- persistence
+
+static void saveInt(const char *key, int v) {
+  if (!prefs.isKey(key) || prefs.getInt(key, 0) != v) prefs.putInt(key, v);
+}
+
+static void saveStr(const char *key, const char *v) {
+  if (!prefs.isKey(key) || prefs.getString(key, "") != v) prefs.putString(key, v);
+}
+
+static void loadStr(const char *key, char *dst, size_t len, const char *def) {
+  // getString() logs an error for missing keys, so check first.
+  String s = prefs.isKey(key) ? prefs.getString(key, def) : String(def);
+  copyStr(dst, len, s.c_str());
+}
+
+static void defaultSettings(Settings &s) {
+  s.station = DEFAULT_STATION;
+  s.tx = true;
+  s.pin = RADIO_PIN;
+  s.drive = GPIO_DRIVE_CAP_2;
+  s.led = true;
+  s.ntp = true;
+  s.dstMode = TC_DST_AUTO;
+  s.tzName[0] = 0;
+  s.tzPosix[0] = 0;
+  copyStr(s.ntpServer, sizeof(s.ntpServer), DEFAULT_NTP_SERVER);
+  copyStr(s.host, sizeof(s.host), DEFAULT_HOSTNAME);
+}
+
+// Small string hash so secrets.h credentials are only applied when they change.
+static String hashStr(const char *s) {
+  uint32_t h = 5381;
+  while (*s) h = h * 33 + (uint8_t)*s++;
+  return String(h, HEX);
+}
+
+static void loadSettings() {
+  prefs.begin("clocksync", false);
+  Settings d;
+  defaultSettings(d);
+  cfg = d;
+  int v = prefs.getInt("station", d.station);
+  cfg.station = (v >= 0 && v < TC_STATION_COUNT) ? v : d.station;
+  cfg.tx = prefs.getInt("tx", 1) != 0;
+  v = prefs.getInt("pin", d.pin);
+  cfg.pin = pinAllowed(v) ? v : d.pin;
+  v = prefs.getInt("drive", d.drive);
+  cfg.drive = (v >= GPIO_DRIVE_CAP_0 && v <= GPIO_DRIVE_CAP_3) ? v : d.drive;
+  cfg.led = prefs.getInt("led", 1) != 0;
+  // v1.x could save "ntp=0" after a single failed boot; v2 uses a new key.
+  cfg.ntp = prefs.getInt("ntp2", 1) != 0;
+  v = prefs.getInt("dst", d.dstMode);
+  cfg.dstMode = (v >= 0 && v <= 2) ? v : d.dstMode;
+  loadStr("ssid", cfg.ssid, sizeof(cfg.ssid), "");
+  loadStr("pass", cfg.pass, sizeof(cfg.pass), "");
+  loadStr("tzname", cfg.tzName, sizeof(cfg.tzName), "");
+  loadStr("tz", cfg.tzPosix, sizeof(cfg.tzPosix), "");
+  loadStr("ntpsrv", cfg.ntpServer, sizeof(cfg.ntpServer), d.ntpServer);
+  loadStr("host", cfg.host, sizeof(cfg.host), d.host);
+  if (!validServer(cfg.ntpServer)) copyStr(cfg.ntpServer, sizeof(cfg.ntpServer), d.ntpServer);
+  if (!validHostname(cfg.host)) copyStr(cfg.host, sizeof(cfg.host), d.host);
+
+  // Zone names are stored; refresh their rules from this firmware's tzdata.
+  if (cfg.tzName[0] && strcmp(cfg.tzName, "custom") != 0) {
+    char posix[64];
+    if (tzLookup(cfg.tzName, posix, sizeof(posix))) {
+      copyStr(cfg.tzPosix, sizeof(cfg.tzPosix), posix);
+    } else if (!validPosix(cfg.tzPosix)) {
+      cfg.tzName[0] = 0;
     }
-    if (tick_timer) {
-      esp_timer_stop(tick_timer);
-    }
-    // Turn off carrier and tristate the pin (high-impedance).
-    // Avoid ledc_stop() which can pause the timer and cause restart issues.
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_ID, 0);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_ID);
-    pinMode(pinRadio, INPUT);  // detach LEDC, Hi-Z: no current through antenna
-    istimerstarted = 0;
   }
-}
+  if (strcmp(cfg.tzName, "custom") == 0 && !validPosix(cfg.tzPosix)) cfg.tzName[0] = 0;
 
-// setup amplitude value ampmod depends on bit pattern & 0.1 second frame
-void ampchange(void) {
-  // handled in loop() by LEDC amplitude update
-  return;
-}
-
-void setTxState(int enable) {
-  if (enable) {
-    txEnabled = 1;
-    starttimer();
-  } else {
-    txEnabled = 0;
-    stoptimer();
-    // Force LED off
-    if (ledEnabled) {
-      if (PIN_LED >= 0) {
-        digitalWrite(PIN_LED, LOW);
-      } else {
-        M5.dis.drawpix(0, 0x000000);
-      }
-      lastLedState = 0;
+  // Credentials from secrets.h win once each time they are changed and reflashed.
+  const char *ssid = WIFI_SSID;
+  if (ssid[0] && strcmp(ssid, "YourSSID") != 0) {
+    String sig = hashStr((String(WIFI_SSID) + "\n" + WIFI_PASS).c_str());
+    if (!prefs.isKey("csig") || prefs.getString("csig", "") != sig) {
+      copyStr(cfg.ssid, sizeof(cfg.ssid), WIFI_SSID);
+      copyStr(cfg.pass, sizeof(cfg.pass), WIFI_PASS);
+      saveStr("ssid", cfg.ssid);
+      saveStr("pass", cfg.pass);
+      prefs.putString("csig", sig);
     }
   }
 }
 
-
-void setstation(int station) {
-  stoptimer();
-  LOG_PRINTF("station #%d:\n", station);
-  currentStation = station;
-  tm0cycle = 80000 / st_cycle2[station];
-  radiodiv = st_cycle2[station];
-  LOG_PRINTF("  freq %fMHz, timer intr: 80M / (%d x %d), buzz/radio: /%d\n",
-             (float)radiodiv / 2., tm0cycle, TM0RES, radiodiv);
-  bits60 = st_bits[station];
-  LOG_PRINTF("  bits60 pattern: ");
-  for (int i = 0; i < 60; i++) {
-    LOG_PRINTF("%d", (int)bits60[i]);
-  }
-  secpattern = st_sp[station];
-  LOG_PRINTF("\n  second pattern: ");
-  for (int i = 0; i < 10; i++) {
-    LOG_PRINTF("%d", (int)secpattern[i]);
-  }
-  LOG_PRINTF("...\n");
-  makebitpattern = st_makebits[station];
-  makebitpattern();
-  printbits60();
-  if (txEnabled) {
-    starttimer();
-  }
-  return;
+static void saveRadioSettings() {
+  saveInt("station", cfg.station);
+  saveInt("tx", cfg.tx ? 1 : 0);
+  saveInt("pin", cfg.pin);
+  saveInt("drive", cfg.drive);
+  saveInt("dst", cfg.dstMode);
 }
 
-//...................................................................
-// makeup bit pattern for current date, hour:min
+// --------------------------------------------------------------------- radio
 
-void mbc_wwvbjjy(void)  //--- [0..33] are common in WWVB/JJY
-{
-  binarize(nowtm.tm_min / 10, 1, 3);
-  binarize(nowtm.tm_min % 10, 5, 4);
-  binarize(nowtm.tm_hour / 10, 12, 2);
-  binarize(nowtm.tm_hour % 10, 15, 4);
-  int y100 = nowtm.tm_yday / 100;
-  int y1 = (nowtm.tm_yday - y100 * 100);
-  int y10 = y1 / 10;
-  y1 = y1 % 10;
-  binarize(y100, 22, 2);
-  binarize(y10, 25, 4);
-  binarize(y1, 30, 4);
-  //  Serial.printf("min%d-%d hour%d-%d doy%d-%d-%d ", tmin / 10, tmin % 10, thour / 10, thour % 10,
-  //    y100, y10, y1);
-  return;
+// The tick task calls localtime_r(); never let it see a half-written TZ.
+static void applyTimeZone() {
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
+  setenv("TZ", effectivePosix(), 1);
+  tzset();
+  frameDirty = true;
+  xSemaphoreGive(radioMutex);
 }
 
-void mb_jjy(void)  //---- JJY_E & JJY_W
-{
-  LOG_PRINT("encode JJY format - ");
-  mbc_wwvbjjy();
-  bits60[36] = parity(12, 7);
-  bits60[37] = parity(1, 8);
-  //  Serial.printf("pa2%d ", s % 2);
-  binarize((nowtm.tm_year - 100) / 10, 41, 4);
-  binarize(nowtm.tm_year % 10, 45, 4);
-  binarize(nowtm.tm_wday, 50, 3);
-  //  Serial.printf("year%d-%d dow%d\n", tyear / 10, tyear % 10, tdow);
-  return;
+static void pinHighZ(int pin) {
+  gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+  gpio_set_pull_mode((gpio_num_t)pin, GPIO_FLOATING);
 }
 
-void mb_wwvb(void) {
-  LOG_PRINT("encode WWVB format - ");
-  // For display/debug only; actual modulation uses wwvb_bits
-  time_t nowtime;
-  time(&nowtime);
-  struct tm *utm = gmtime(&nowtime);
-  struct tm ut = *utm;
-  // minutes
-  binarize(ut.tm_min / 10, 1, 3);
-  binarize(ut.tm_min % 10, 5, 4);
-  // hours
-  binarize(ut.tm_hour / 10, 12, 2);
-  binarize(ut.tm_hour % 10, 15, 4);
-  // day of year (1..366)
-  int yday1 = ut.tm_yday + 1;
-  binarize((yday1 / 100) % 10, 22, 2);
-  binarize((yday1 / 10) % 10, 25, 4);
-  binarize(yday1 % 10, 30, 4);
-  // year (00..99)
-  binarize((ut.tm_year) / 10, 45, 4);
-  binarize((ut.tm_year) % 10, 50, 4);
-  // local DST state (approximate; not used for modulation)
-  bits60[57] = nowtm.tm_isdst ? SP_1 : SP_0;
-  bits60[58] = isUSDSTPending2h();
-  return;
-}
-
-void mb_dcf(void)  //---- DCF77
-{
-  LOG_PRINT("encode DCF77 format - ");
-  //  bits60[0] = SP_0; // (obsolate) this routine is used also by mb_hbg() which changes bits60[0]
-  // Seasonal flags (Z1/Z2)
-  if (getDSTFlag()) {
-    bits60[17] = SP_1;  // Z1 = 1
-    bits60[18] = SP_0;  // Z2 = 0 (DST)
-  } else {
-    bits60[17] = SP_0;  // Z1 = 0
-    bits60[18] = SP_1;  // Z2 = 1 (standard)
-  }
-  rbcdize(nowtm.tm_min, 21, 7);
-  bits60[28] = parity(21, 7);
-  rbcdize(nowtm.tm_hour, 29, 6);
-  bits60[35] = parity(29, 6);
-  rbcdize(nowtm.tm_mday, 36, 6);
-  rbinarize(nowtm.tm_wday, 42, 3);
-  rbcdize(nowtm.tm_mon + 1, 45, 5);
-  rbcdize(nowtm.tm_year - 100, 50, 8);
-  bits60[58] = parity(36, 22);
-  return;
-}
-
-/*
-void
-mb_hbg(void)   //---- HBG
-{
-    mb_dcf();
-    if (tmin != 0) {
-      bits60[0] = SP_M0;
-    } else {
-      if (thour % 12 != 0) {
-        bits60[0] = SP_M00;
-      } else {
-        bits60[0] = SP_M000;
-      }
-    }
-    return;
-}
-*/
-
-void mb_bsf(void)  //---- BSF
-{
-  LOG_PRINT("encode BSF format - ");
-  quadize(nowtm.tm_min, 41, 3);
-  quadize(nowtm.tm_hour * 2, 44, 3);
-  bits60[46] |= qparity(41, 6);
-  quadize(nowtm.tm_mday * 2, 47, 3);
-  bits60[49] |= nowtm.tm_wday / 4;
-  quadize(nowtm.tm_wday % 4, 50, 1);
-  quadize(nowtm.tm_mon + 1, 51, 2);
-  quadize((nowtm.tm_year - 100) * 2, 53, 4);
-  bits60[56] |= qparity(47, 10);
-  return;
-}
-
-void mb_msf(void) {
-  LOG_PRINT("encode MSF format - ");
-  bcdize(nowtm.tm_year - 100, 17, 8);
-  bcdize(nowtm.tm_mon + 1, 25, 5);
-  bcdize(nowtm.tm_mday, 30, 6);
-  binarize(nowtm.tm_wday, 36, 3);
-  bcdize(nowtm.tm_hour, 39, 6);
-  bcdize(nowtm.tm_min, 45, 7);
-  bits60[54] = parity(17, 8) * 2 + 1;   // in MSF parity bits, values are {1, 3} (SP_1, SP_P1)
-  bits60[55] = parity(25, 11) * 2 + 1;  // for parity {0, 1}.
-  bits60[56] = parity(36, 3) * 2 + 1;
-  bits60[57] = parity(39, 13) * 2 + 1;
-  // Set summertime indicator using DST override
-  bits60[58] = getDSTFlag() ? SP_P1 : SP_1;
-
-  return;
-}
-
-void mb_bpc(void) {
-  LOG_PRINT("encode BPC format - ");
-  quadize(nowtm.tm_hour % 12, 3, 2);
-  quadize(nowtm.tm_min, 5, 3);
-  quadize(nowtm.tm_wday, 8, 2);
-  bits60[10] = (nowtm.tm_hour / 12) * 2 + qparity(3, 7);
-  quadize(nowtm.tm_mday, 11, 3);
-  quadize(nowtm.tm_mon + 1, 14, 2);
-  quadize(nowtm.tm_year - 100, 16, 3);
-  bits60[19] = qparity(11, 8);
-  for (int i = 2; i < 20; i++) {
-    bits60[20 + i] = bits60[i];
-    bits60[40 + i] = bits60[i];
-  }
-  return;
-}
-
-
-// write binary value into bit pattern (little endian)
-void binarize(int v, int pos, int len) {
-  for (pos = pos + len - 1; 0 < len; pos--, len--) {
-    bits60[pos] = (uint8_t)(v & 1);
-    v >>= 1;
-  }
-  return;
-}
-
-void IRAM_ATTR meas_isr(void) {
-  measCount++;
-}
-
-// -- LEDC carrier helpers -------------------------------------------------
-
-void setupCarrierLEDC(void) {
-  // Configure LEDC timer and channel for the selected frequency (ESP-IDF)
-  ledc_timer_config_t tcfg = {};
-  tcfg.speed_mode = LEDC_MODE;
-  tcfg.duty_resolution = (ledc_timer_bit_t)LEDC_RES_BITS;
-  tcfg.timer_num = LEDC_TIMERIDX;
-  tcfg.freq_hz = carrierHz;
-  tcfg.clk_cfg = LEDC_AUTO_CLK;
-  ledc_timer_config(&tcfg);
-
-  ledc_channel_config_t c = {};
-  c.gpio_num = pinRadio;
-  c.speed_mode = LEDC_MODE;
-  c.channel = LEDC_CHANNEL_ID;
-  c.intr_type = LEDC_INTR_DISABLE;
-  c.timer_sel = LEDC_TIMERIDX;
-  c.duty = dutyHigh;
-  c.hpoint = 0;
-  ledc_channel_config(&c);
-}
-
-void setCarrierPowerLevel(int highPower) {
-  uint32_t d = highPower ? (uint32_t)dutyHigh : (uint32_t)dutyLow;
-  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_ID, d);
-  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_ID);
-}
-
-// -- esp_timer aligned tick scheduler ------------------------------------
-
-void IRAM_ATTR onTick100ms(void *arg) {
-  int t = tssec + 1;
-  if (t >= 10) {
-    t = 0;
-    secBoundaryFlag = 1;
-  }
-  tssec = t;
-  tickFlag = 1;
-}
-
-void IRAM_ATTR onAlignedStart(void *arg) {
-  // Start periodic 100ms timer exactly at second boundary
-  if (!tick_timer) {
-    esp_timer_create_args_t targs = {};
-    targs.callback = &onTick100ms;
-    targs.arg = NULL;
-    targs.dispatch_method = ESP_TIMER_TASK;
-    targs.name = "tick100ms";
-    esp_timer_create(&targs, &tick_timer);
-  }
-  tssec = 0;
-  secBoundaryFlag = 1;
-  tickFlag = 1;
-  esp_timer_start_periodic(tick_timer, 100000);  // 100 ms
-}
-
-void scheduleAlignedTicks(void) {
-  // Create or restart a one-shot timer to fire at the next wall-clock second
-  if (!align_timer) {
-    esp_timer_create_args_t aargs = {};
-    aargs.callback = &onAlignedStart;
-    aargs.arg = NULL;
-    aargs.dispatch_method = ESP_TIMER_TASK;
-    aargs.name = "alignStart";
-    esp_timer_create(&aargs, &align_timer);
-  }
+static void scheduleNextTick(int64_t slot) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  int64_t us_to_next = 1000000 - tv.tv_usec;
-  if (us_to_next <= 0) us_to_next = 1;
-  esp_timer_start_once(align_timer, (uint64_t)us_to_next);
+  int64_t nowUs = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+  int64_t delay = (slot + 1) * 100000 - nowUs;
+  if (delay < 100) delay = 100;
+  if (delay > 150000) delay = 100000;  // the clock stepped back mid-tick; resync next time
+  esp_timer_stop(tickTimer);
+  esp_timer_start_once(tickTimer, (uint64_t)delay);
 }
 
-// -- WWVB minute bits exactly like txtempus ------------------------------
-
-static uint64_t to_padded5_bcd(int n) {
-  return (uint64_t)(((n / 100) % 10) << 10) | (uint64_t)(((n / 10) % 10) << 5) | (uint64_t)(n % 10);
-}
-
-static int is_leap_year_full(int year) {
-  return (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
-}
-
-void prepareWWVBMinuteBits(time_t minuteStartUTC) {
-  struct tm ut;
-  gmtime_r(&minuteStartUTC, &ut);
-
-  // Build 60-bit frame, bit 59 is first second of the minute
-  uint64_t bits = 0ULL;
-  bits |= to_padded5_bcd(ut.tm_min) << (59 - 8);
-  bits |= to_padded5_bcd(ut.tm_hour) << (59 - 18);
-  bits |= to_padded5_bcd(ut.tm_yday + 1) << (59 - 33);
-  bits |= to_padded5_bcd(ut.tm_year % 100) << (59 - 53);
-  bits |= (uint64_t)(is_leap_year_full(ut.tm_year + 1900) ? 1 : 0) << (59 - 55);
-
-  // DST flags (bits 57-58): derived from TZ via localtime_r().
-  // TZ must be set to a US timezone for correct WWVB DST indication.
-  struct tm lt_now, lt_tom;
-  time_t t_now_local = minuteStartUTC;
-  localtime_r(&t_now_local, &lt_now);
-  time_t t_tom_local = minuteStartUTC + 86400;
-  localtime_r(&t_tom_local, &lt_tom);
-  bits |= (uint64_t)(lt_tom.tm_isdst ? 1 : 0) << (59 - 57);
-  bits |= (uint64_t)(lt_now.tm_isdst ? 1 : 0) << (59 - 58);
-
-  wwvb_bits = bits;
-}
-
-// Return 1 if a US DST switch occurs within the next 2 hours (local time)
-int isUSDSTPending2h(void) {
-  // current local time_t from nowtm
-  struct tm nowLocal = nowtm;
-  time_t nowt = mktime(&nowLocal);
-  int year = nowLocal.tm_year;  // years since 1900
-
-  auto firstSunday = [](int year1900, int mon) -> int {
-    struct tm t = { 0 };
-    t.tm_year = year1900;
-    t.tm_mon = mon;
-    t.tm_mday = 1;
-    t.tm_hour = 0;
-    t.tm_isdst = -1;
-    mktime(&t);
-    int dow = t.tm_wday;  // 0..6, 0=Sunday
-    return 1 + ((7 - dow) % 7);
-  };
-
-  auto secondSunday = [&](int year1900, int mon) -> int {
-    int d1 = firstSunday(year1900, mon);
-    return d1 + 7;
-  };
-
-  // DST start: second Sunday in March, 02:00 local
-  struct tm spring = { 0 };
-  spring.tm_year = year;
-  spring.tm_mon = 2;  // March
-  spring.tm_mday = secondSunday(year, 2);
-  spring.tm_hour = 2;
-  spring.tm_isdst = -1;
-  time_t tSpring = mktime(&spring);
-
-  // DST end: first Sunday in November, 02:00 local
-  struct tm fall = { 0 };
-  fall.tm_year = year;
-  fall.tm_mon = 10;  // November
-  fall.tm_mday = firstSunday(year, 10);
-  fall.tm_hour = 2;
-  fall.tm_isdst = -1;
-  time_t tFall = mktime(&fall);
-
-  time_t tx;
-  if (nowLocal.tm_isdst > 0) {  // currently DST → next is fall
-    if (nowt < tFall) {
-      tx = tFall;
-    } else {
-      // compute next year's fall
-      fall.tm_year = year + 1;
-      fall.tm_mday = firstSunday(year + 1, 10);
-      tx = mktime(&fall);
+// Runs at every 100 ms boundary of the wall clock. The slot is recomputed
+// from gettimeofday() each time, so NTP adjustments re-align by themselves
+// and HTTP or Wi-Fi work in loop() never delays the modulation.
+static void onTick(void *) {
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
+  if (radioOn) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t nowUs = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+    int64_t slot = (nowUs + 50000) / 100000;  // nearest 100 ms boundary
+    time_t sec = (time_t)(slot / 10);
+    int tenth = (int)(slot % 10);
+    time_t minute = sec - sec % 60;
+    if (minute != frameMinute || frameDirty) {
+      frameDirty = false;
+      tc_build_minute(radioStation, minute, cfg.dstMode, frame);
+      frameMinute = minute;
+      frameCount = frameCount + 1;
     }
-  } else {  // currently standard → next is spring
-    if (nowt < tSpring) {
-      tx = tSpring;
-    } else {
-      // next year's spring
-      spring.tm_year = year + 1;
-      spring.tm_mday = secondSunday(year + 1, 2);
-      tx = mktime(&spring);
-    }
+    int high = forceCarrier ? 1 : tc_carrier_high(radioStation, frame[sec % 60], tenth);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, high ? DUTY_HIGH : DUTY_LOW);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    carrierHigh = high;
+    scheduleNextTick(slot);
   }
-
-  double dt = difftime(tx, nowt);
-  return (dt >= 0 && dt <= 7200) ? 1 : 0;
+  xSemaphoreGive(radioMutex);
 }
 
-int getDSTFlag(void) {
-  if (dstOverride == 2) {
-    return (nowtm.tm_isdst > 0) ? 1 : 0;
+static void radioStopLocked() {
+  if (!radioOn) return;
+  radioOn = false;
+  esp_timer_stop(tickTimer);
+  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
+  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+  pinHighZ(radioPin);  // no current through the antenna while off
+  carrierHigh = 0;
+}
+
+static void radioStop() {
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
+  radioStopLocked();
+  xSemaphoreGive(radioMutex);
+}
+
+static void radioStart() {
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
+  radioStopLocked();
+  radioStation = cfg.station;
+  radioPin = cfg.pin;
+
+  ledc_timer_config_t t = {};
+  t.speed_mode = LEDC_MODE;
+  t.duty_resolution = (ledc_timer_bit_t)LEDC_BITS;
+  t.timer_num = LEDC_TIMER;
+  t.freq_hz = tc_stations[radioStation].freq_hz;
+  t.clk_cfg = LEDC_AUTO_CLK;
+  esp_err_t err = ledc_timer_config(&t);
+  ledc_channel_config_t c = {};
+  c.gpio_num = radioPin;
+  c.speed_mode = LEDC_MODE;
+  c.channel = LEDC_CHANNEL;
+  c.intr_type = LEDC_INTR_DISABLE;
+  c.timer_sel = LEDC_TIMER;
+  c.duty = DUTY_HIGH;
+  c.hpoint = 0;
+  if (err == ESP_OK) err = ledc_channel_config(&c);
+  if (err != ESP_OK) {
+    Serial.printf("radio: LEDC setup failed (%d)\n", (int)err);
+    pinHighZ(radioPin);
+    xSemaphoreGive(radioMutex);
+    return;
   }
-  return dstOverride ? 1 : 0;
+  gpio_set_drive_capability((gpio_num_t)radioPin, (gpio_drive_cap_t)cfg.drive);
+  frameDirty = true;
+  radioOn = true;
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  scheduleNextTick(((int64_t)tv.tv_sec * 1000000 + tv.tv_usec) / 100000);
+  xSemaphoreGive(radioMutex);
+  Serial.printf("radio: %s on GPIO %d, %lu Hz (LEDC %lu Hz)\n", tc_stations[radioStation].name, radioPin,
+                (unsigned long)tc_stations[radioStation].freq_hz,
+                (unsigned long)ledc_get_freq(LEDC_MODE, LEDC_TIMER));
 }
 
+static void radioSetup() {
+  radioMutex = xSemaphoreCreateMutex();
+  esp_timer_create_args_t args = {};
+  args.callback = &onTick;
+  args.dispatch_method = ESP_TIMER_TASK;
+  args.name = "clocksync_tick";
+  esp_timer_create(&args, &tickTimer);
+  pinHighZ(cfg.pin);
+}
 
-// continuous (over 4 bit) BCD to write
-void bcdize(int v, int pos, int len) {
-  int l;
-
-  pos = pos + len - 1;
-  while (0 < len) {
-    if (4 <= len) {
-      l = 4;
-    } else {
-      l = len;
-    }
-    binarize(v % 10, pos - l + 1, l);
-    v = v / 10;
-    pos = pos - l;
-    len = len - l;
+// Start or stop the carrier to match the settings and the clock.
+static void radioLoop() {
+  bool want = cfg.tx && timeValid();
+  if (want && (!radioOn || radioStation != cfg.station || radioPin != cfg.pin)) {
+    radioStart();
+  } else if (!want && radioOn) {
+    radioStop();
+    Serial.println(cfg.tx ? "radio: waiting for the time to be set" : "radio: off");
   }
-  return;
 }
 
-// LSB->MSB (big endian) binarize
-void rbinarize(int v, int pos, int len) {
-  for (; 0 < len; pos++, len--) {
-    bits60[pos] = (uint8_t)(v & 1);
-    v >>= 1;
-  }
-  return;
-}
-
-// LSB->MSB BCDize
-void rbcdize(int v, int pos, int len) {
-  int l;
-
-  LOG_PRINTF("\nrbcd %d[pos %d, len%d]=", v, pos, len);
-  while (0 < len) {
-    if (4 <= len) {
-      l = 4;
-    } else {
-      l = len;
-    }
-    rbinarize(v % 10, pos, l);
-    v = v / 10;
-    pos = pos + l;
-    len = len - l;
-  }
-  return;
-}
-
-
-// 4-ary encoding (little endian)
-void quadize(int v, int pos, int len) {
-  for (pos = pos + len - 1; 0 < len; pos--, len--) {
-    bits60[pos] = (uint8_t)(v & 3);
-    v >>= 2;
-  }
-  return;
-}
-
-// calculate even parity
-int parity(int pos, int len) {
-  int s = 0;
-
-  for (pos; 0 < len; pos++, len--) {
-    s += bits60[pos];
-  }
-  return (s % 2);
-}
-
-// binary parity for 4-ary data (for BSF/BPC): is it OK?
-int qparity(int pos, int len) {
-  int s = 0;
-
-  for (pos; 0 < len; pos++, len--) {
-    s += (bits60[pos] & 1) + ((bits60[pos] & 2) >> 1);
-  }
-  return (s % 2);
-}
-
-
-
-
-//...................................................................
-// Command handler
-//
-// Processes commands from Serial (USB) and HTTP.
-// See README.md for the full command reference.
-//
-
-
-int docmd(char *buf) {
-  int arg1, arg2;
-  LOG_PRINTF("cmd: >>%s<<\n", buf);
-  if (buf[0] == 'd' || buf[0] == 'D') {  // set date
-    if (strlen(buf) != 7) {
-      return 0;
-    }
-    int y = a2toi(buf + 1);
-    int m = a2toi(buf + 3);
-    int d = a2toi(buf + 5);
-    LOG_PRINTF("%d %d %d\n", y, m, d);
-    if (y < 0 || m < 0 || 12 < m || d < 0 || 31 < d) {  // can set Feb 31 :-)
-      return 0;
-    }
-    nowtm.tm_year = y + 100;
-    nowtm.tm_mon = m - 1;
-    nowtm.tm_mday = d;
-    setlocaltime();
-    LOG_PRINTF("set date: >>%s<<\n", buf + 1);
-    return 1;
-  } else if (buf[0] == 't' || buf[0] == 'T') {  // set time & start tick
-    if (strlen(buf) != 7) {
-      return 0;
-    }
-    int h = a2toi(buf + 1);
-    int m = a2toi(buf + 3);
-    int s = a2toi(buf + 5);
-    if (h < 0 || 24 < h || m < 0 || 60 < m || s < 0 || 60 < s) {
-      return 0;
-    }
-    nowtm.tm_hour = h;
-    nowtm.tm_min = m;
-    nowtm.tm_sec = s;
-    tssec = 0;
-    ampc = 0;
-    radioc = 0;  // no semaphore lock: don't care if override by intr routine :-)
-    setlocaltime();
-    LOG_PRINTF("set time...restart tick: >>%s<<\n", buf + 1);
-    return 1;
-  } else if (buf[0] == 'z' || buf[0] == 'Z') {  // buzzer on(1)/off(0)
-    if (buf[1] == '0') {
-      buzzsw = 0;
-    } else if (buf[1] == '1') {
-      buzzsw = 1;
-    } else {
-      return 0;
-    }
-    LOG_PRINTF("buzzer: >>%c<<\n", buf + 1);
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'l' || buf[0] == 'L') {  // LED on(1)/off(0)
-    if (buf[1] == '0') {
-      ledEnabled = 0;
-    } else if (buf[1] == '1') {
-      ledEnabled = 1;
-    } else {
-      return 0;
-    }
-    // Apply immediately with proper hardware state
-    if (PIN_LED >= 0) {
-      if (ledEnabled) {
-        pinMode(PIN_LED, OUTPUT);
-        digitalWrite(PIN_LED, LOW);
-        lastLedState = 0;
-      } else {
-        pinMode(PIN_LED, INPUT);  // tri-state
-        lastLedState = -2;
-      }
-    } else {
-      if (ledEnabled) {
-        M5.dis.drawpix(0, 0x000000);
-        lastLedState = 0;
-      } else {
-        M5.dis.drawpix(0, 0x000000);
-        lastLedState = -2;
-      }
-    }
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 's' || buf[0] == 'S') {  // set station
-    char s[] =                                  //"jJkKwWdDhHmMbB"
-      { 'j', 'J', 'k', 'K', 'w', 'W', 'd', 'D', 't', 'T', 'm', 'M', 'c', 'C', '\0' },
-         *chp;
-    if ((chp = strchr(s, buf[1])) != NULL) {
-      setstation((int)(chp - s) / 2);
-      saveSettings();
-      return 1;
-    } else {
-      return 0;
-    }
-  } else if (buf[0] == 'p' || buf[0] == 'P') {  // set radio output pin number
-    // accepts decimal gpio number, e.g., p26
-    int plen = strlen(buf);
-    if (plen < 2 || plen > 3) {
-      return 0;
-    }
-    int newPin = atoi(buf + 1);
-    if (!isSafeAtomPin(newPin)) {
-      LOG_PRINTF("pin not allowed: %d\n", newPin);
-      return 0;
-    }
-    int oldPin = pinRadio;
-    if (oldPin == newPin) {
-      return 1;
-    }
-    stoptimer();
-    pinMode(oldPin, INPUT);        // tristate old pin (Hi-Z)
-    pinRadio = newPin;
-    pinMode(pinRadio, OUTPUT);
-    digitalWrite(pinRadio, LOW);   // new pin ready for LEDC
-    applyDriveStrength();
-    if (txEnabled) {
-      starttimer();
-    }
-    LOG_PRINTF("radio pin set to %d\n", pinRadio);
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'e' || buf[0] == 'E') {  // TX enable/disable
-    if (buf[1] == '0') {
-      setTxState(0);
-      lastCmdResp = String("TX disabled\n");
-    } else if (buf[1] == '1') {
-      setTxState(1);
-      lastCmdResp = String("TX enabled\n");
-    } else {
-      return 0;
-    }
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'g' || buf[0] == 'G') {  // set GPIO drive strength 0..3
-    if (strlen(buf) != 2) {
-      return 0;
-    }
-    int level = buf[1] - '0';
-    if (level < GPIO_DRIVE_CAP_0 || level > GPIO_DRIVE_CAP_3) {
-      return 0;
-    }
-    driveStrength = clampDriveCap(level);
-    applyDriveStrength();
-    LOG_PRINTF("GPIO drive strength set to %d (0=weakest,3=strongest)\n", driveStrength);
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'y' || buf[0] == 'Y') {  // NTP sync
-    if (buf[1] == '0') {
-      ntpsync = 0;
-      ntpstop();
-    } else if (buf[1] == '1') {
-      ntpsync = 1;
-      ntpstart();
-    } else {
-      return 0;
-    }
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'f' || buf[0] == 'F') {  // frequency self-test (jumper radio pin to PIN_MEAS)
-    pinMode(PIN_MEAS, INPUT_PULLDOWN);
-    measCount = 0;
-    overrideCarrier = 1;
-    attachInterrupt(digitalPinToInterrupt(PIN_MEAS), meas_isr, RISING);
-    delay(200);
-    detachInterrupt(digitalPinToInterrupt(PIN_MEAS));
-    overrideCarrier = 0;
-    uint32_t hz = (uint32_t)(measCount * 5);
-    if (hz == 0) {
-      // Fallback: read LEDC timer freq if no edges captured
-      uint32_t ledcHz = ledc_get_freq(LEDC_MODE, LEDC_TIMERIDX);
-      LOG_PRINTF("no edges on GPIO%d; LEDC timer reports ~%u Hz (expected ~%d Hz)\n",
-                 PIN_MEAS, ledcHz, radiodiv * 500);
-      lastCmdResp = String("no edges on GPIO") + String(PIN_MEAS) + String("; LEDC ~") + String(ledcHz) + String(" Hz (expected ~") + String(radiodiv * 500) + String(" Hz)\n");
-    } else {
-      LOG_PRINTF("measured ~%u Hz on GPIO%d (expected ~%d Hz)\n",
-                 hz, PIN_MEAS, radiodiv * 500);
-      lastCmdResp = String("measured ~") + String(hz) + String(" Hz on GPIO") + String(PIN_MEAS) + String(" (expected ~") + String(radiodiv * 500) + String(" Hz)\n");
-    }
-    return 1;
-  } else if (buf[0] == 'n' || buf[0] == 'N') {  // WWVB next-minute encoding off/on
-    if (buf[1] == '0') {
-      wwvbEncodeNextMinute = 0;
-    } else if (buf[1] == '1') {
-      wwvbEncodeNextMinute = 1;
-    } else {
-      return 0;
-    }
-    LOG_PRINTF("WWVB next-minute encoding: %s (compatibility only; framing follows txtempus)\n", wwvbEncodeNextMinute ? "on" : "off");
-    return 1;
-  } else if (buf[0] == 'x' || buf[0] == 'X') {  // DST override
-    if (buf[1] == '0') dstOverride = 0;         // STD
-    else if (buf[1] == '1') dstOverride = 1;    // DST
-    else if (buf[1] == '2') dstOverride = 2;    // AUTO
-    else return 0;
-    LOG_PRINTF("DST override: %s (DCF/MSF only; WWVB uses TZ-derived DST)\n", dstOverride == 2 ? "auto" : (dstOverride ? "DST" : "STD"));
-    saveSettings();
-    return 1;
-  } else if (buf[0] == 'r' || buf[0] == 'R') {  // reset to defaults and clear persisted settings
-    applyDefaultSettings();
-    // Clear saved prefs so next boot uses defaults
-    prefs.begin("clocksync", false);
-    prefs.clear();
-    prefs.end();
-    LOG_PRINTLN("settings reset to defaults");
-    lastCmdResp = String("settings reset to defaults\n");
-    return 1;
-  } else if (buf[0] == 'h' || buf[0] == 'H') {  // help
-    printhelp();
-    return 1;
-  }
-  return 0;
-}
-
-int a2toi(char *chp) {
-  int v = 0;
-  for (int i = 0; i < 2; chp++, i++) {
-    if (*chp < '0' || '9' < *chp) {
-      return -1;
-    }
-    v = v * 10 + (*chp - '0');
-  }
-  return v;
-}
-
-
-void printbits60(void) {
-  LOG_PRINT("\n");
+static String frameString() {
+  char buf[61];
+  xSemaphoreTake(radioMutex, portMAX_DELAY);
   for (int i = 0; i < 60; i++) {
-    LOG_PRINT(bits60[i]);
+    buf[i] = frame[i] == TC_SYM_MARK ? 'M' : (char)('0' + frame[i]);
   }
-  LOG_PRINT("\n");
-  return;
+  xSemaphoreGive(radioMutex);
+  buf[60] = 0;
+  return radioOn ? String(buf) : String();
 }
 
-void printhelp(void) {
-  LOG_PRINTF("clocksync v%s\n\n", VERSION);
-  LOG_PRINTLN("Status:");
-  LOG_PRINTF("  Station : %s\n", stationNames[currentStation]);
-  LOG_PRINTF("  TX      : %s\n", txEnabled ? "enabled" : "disabled");
-  int carrierHz = radiodiv * 500;  // radiodiv is double-freq in kHz
-  LOG_PRINTF("  Carrier : %d Hz (%.1f kHz)\n", carrierHz, (float)carrierHz / 1000.0);
-  LOG_PRINTF("  Pin     : GPIO %d\n", pinRadio);
-  LOG_PRINTF("  Drive   : %d (0=weak, 3=strong)\n", driveStrength);
-  LOG_PRINTF("  NTP     : %s\n", ntpsync ? "on" : "off");
-  LOG_PRINTF("  TZ      : %s\n", TZ);
-  LOG_PRINTF("  Buzzer  : %s\n", buzzsw ? "on" : "off");
-  LOG_PRINTF("  DST ov  : %s (DCF/MSF only; WWVB uses TZ-derived DST)\n", dstOverride == 2 ? "auto" : (dstOverride ? "DST" : "STD"));
-  LOG_PRINTF("  WWVB    : txtempus framing; time=UTC; DST bits from TZ (%s).\n", TZ);
+// ------------------------------------------------------------- settings API
 
-  LOG_PRINTLN("\nCommands:");
-  LOG_PRINTLN("  h           : show this help");
-  LOG_PRINTLN("  e0|e1       : TX disable/enable (stop/start carrier + modulation)");
-  LOG_PRINTLN("  y0|y1       : NTP sync off/on");
-  LOG_PRINTLN("  dYYMMDD     : set date (interpreted in local TZ)");
-  LOG_PRINTLN("  tHHmmSS     : set time and restart tick (local TZ)");
-  LOG_PRINTLN("  z0|z1       : buzzer off/on");
-  LOG_PRINTLN("  l0|l1       : LED off/on");
-  LOG_PRINTLN("  pNN         : set radio output pin (e.g., p25)");
-  LOG_PRINTLN("  g0|g1|g2|g3 : set GPIO drive (0=weakest,3=strongest)");
-  LOG_PRINTLN("  f           : self-test: jumper radio pin to GPIO33, measure carrier");
-  LOG_PRINTLN("  n0|n1       : (WWVB) legacy framing toggle — ignored; always txtempus framing");
-  LOG_PRINTLN("  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB uses TZ)");
-  LOG_PRINTLN("  sX          : set station to X (one of):");
-  for (int i = 0; i < 7; i++) {
-    LOG_PRINTF("    s%c : %s\n", stationCmds[i], stationNames[i]);
+static void setStation(int s) {
+  cfg.station = s;
+  saveRadioSettings();
+  applyTimeZone();  // the automatic zone follows the station
+}
+
+static void setTx(bool on) {
+  cfg.tx = on;
+  saveRadioSettings();
+}
+
+static void setDstMode(int m) {
+  cfg.dstMode = m;
+  saveRadioSettings();
+  frameDirty = true;
+}
+
+static void setDrive(int d) {
+  cfg.drive = d;
+  saveRadioSettings();
+  if (radioOn) gpio_set_drive_capability((gpio_num_t)radioPin, (gpio_drive_cap_t)cfg.drive);
+}
+
+static void setPin(int p) {
+  if (p == cfg.pin) return;
+  if (radioOn) radioStop();
+  pinHighZ(cfg.pin);
+  cfg.pin = p;
+  saveRadioSettings();
+}
+
+static void setLed(bool on) {
+  cfg.led = on;
+  saveInt("led", on ? 1 : 0);
+}
+
+// name: "" = station's own zone, "custom" = posix, otherwise an IANA zone.
+static bool setTimeZone(const char *name, const char *posix, String &err) {
+  if (name[0] == 0) {
+    cfg.tzName[0] = 0;
+    cfg.tzPosix[0] = 0;
+  } else if (strcmp(name, "custom") == 0) {
+    if (!validPosix(posix)) {
+      err = "invalid POSIX TZ string";
+      return false;
+    }
+    copyStr(cfg.tzName, sizeof(cfg.tzName), "custom");
+    copyStr(cfg.tzPosix, sizeof(cfg.tzPosix), posix);
+  } else {
+    char rule[64];
+    if (strlen(name) >= sizeof(cfg.tzName) || !tzLookup(name, rule, sizeof(rule))) {
+      err = "unknown time zone";
+      return false;
+    }
+    copyStr(cfg.tzName, sizeof(cfg.tzName), name);
+    copyStr(cfg.tzPosix, sizeof(cfg.tzPosix), rule);
+  }
+  saveStr("tzname", cfg.tzName);
+  saveStr("tz", cfg.tzPosix);
+  applyTimeZone();
+  return true;
+}
+
+// ---------------------------------------------------------------------- time
+
+static void onNtpSync(struct timeval *tv) {
+  lastNtpSync = tv->tv_sec;
+}
+
+static void ntpStop() {
+  if (!ntpRunning) return;
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_sntp_stop();
+#else
+  sntp_stop();
+#endif
+  ntpRunning = false;
+}
+
+static void ntpStart() {
+  ntpStop();
+  ntpServerBuf ^= 1;
+  char *srv = ntpServerBufs[ntpServerBuf];
+  copyStr(srv, sizeof(ntpServerBufs[0]), cfg.ntpServer);
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  sntp_set_sync_interval(3600UL * 1000UL);  // hourly keeps the clock within a few ms
+  xSemaphoreTake(radioMutex, portMAX_DELAY);  // configTzTime also sets TZ
+  configTzTime(effectivePosix(), srv, "time.nist.gov", "time.google.com");
+  xSemaphoreGive(radioMutex);
+  ntpRunning = true;
+  Serial.printf("ntp: using %s\n", srv);
+}
+
+static void setNtp(bool on) {
+  cfg.ntp = on;
+  saveInt("ntp2", on ? 1 : 0);
+  if (on && connected()) ntpStart();
+  if (!on) ntpStop();
+}
+
+static void setNtpServer(const char *s) {
+  copyStr(cfg.ntpServer, sizeof(cfg.ntpServer), s);
+  saveStr("ntpsrv", cfg.ntpServer);
+  if (cfg.ntp && connected()) ntpStart();
+}
+
+static void setClock(time_t sec, long usec) {
+  struct timeval tv;
+  tv.tv_sec = sec;
+  tv.tv_usec = usec;
+  settimeofday(&tv, NULL);
+  frameDirty = true;
+  Serial.printf("time set: %s\n", fmtLocal(sec).c_str());
+}
+
+// ---------------------------------------------------------------------- wifi
+
+static void startMdns() {
+  if (mdnsStarted) return;
+  if (MDNS.begin(hostActive)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+    Serial.printf("mdns: http://%s.local/\n", hostActive);
   }
 }
 
+static String apSsid() {
+  return String(hostActive) + "-setup";
+}
 
-// ------------------------- Web server ---------------------------------
-String generateStatusText(void) {
+static void staBegin() {
+  lastStaAttemptMs = millis();
+  if (cfg.ssid[0] == 0) return;
+  Serial.printf("wifi: connecting to \"%s\"\n", cfg.ssid);
+  WiFi.begin(cfg.ssid, cfg.pass);
+}
+
+static void startAP(bool manual) {
+  apManual = apManual || manual;
+  apStartedMs = millis();
+  if (apActive) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  const char *pw = AP_PASSWORD;
+  if (!WiFi.softAP(apSsid().c_str(), strlen(pw) >= 8 ? pw : NULL)) {
+    Serial.println("wifi: could not start the setup hotspot");
+    WiFi.mode(WIFI_STA);
+    apFailedMs = millis();
+    return;
+  }
+  apFailedMs = 0;
+  dns.start(53, "*", AP_IP);
+  apActive = true;
+  startMdns();
+  Serial.printf("wifi: setup hotspot \"%s\" at http://%s/\n", apSsid().c_str(), AP_IP.toString().c_str());
+}
+
+static void stopAP() {
+  if (!apActive) return;
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  apActive = false;
+  apManual = false;
+  Serial.println("wifi: setup hotspot closed");
+}
+
+static const char *wifiError() {
+  switch (lastDisconnectReason) {
+    case 0:
+    case 8:  // ASSOC_LEAVE: we disconnected on purpose
+      return "";
+    case 2:    // AUTH_EXPIRE
+    case 14:   // MIC_FAILURE
+    case 15:   // 4WAY_HANDSHAKE_TIMEOUT
+    case 202:  // AUTH_FAIL
+    case 204:  // HANDSHAKE_TIMEOUT
+      return "wrong password?";
+    case 201:  // NO_AP_FOUND
+    case 210:  // NO_AP_FOUND_W_COMPATIBLE_SECURITY
+    case 211:  // NO_AP_FOUND_IN_AUTHMODE_THRESHOLD
+    case 212:  // NO_AP_FOUND_IN_RSSI_THRESHOLD
+      return "network not found";
+    default:
+      return "could not connect";
+  }
+}
+
+static void wifiSetup() {
+  WiFi.persistent(false);  // credentials live in our own settings
+  WiFi.setHostname(hostActive);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  // Reconnects are paced by wifiLoop(): the core's own retries rescan
+  // constantly on a wrong password, which knocks phones off the hotspot.
+  WiFi.setAutoReconnect(false);
+  WiFi.onEvent(
+    [](WiFiEvent_t, WiFiEventInfo_t info) {
+      // Keep the last real failure; 8 (ASSOC_LEAVE) is our own disconnect() call.
+      if (info.wifi_sta_disconnected.reason != 8) lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    },
+    ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  if (cfg.ssid[0]) {
+    staBegin();
+  } else {
+    startAP(false);
+  }
+}
+
+static void wifiLoop() {
+  uint32_t now = millis();
+  bool up = connected();
+  if (up && !wasConnected) {
+    everConnected = true;
+    connectedSinceMs = now;
+    lastDisconnectReason = 0;
+    Serial.printf("wifi: connected to \"%s\", http://%s/ (http://%s.local/)\n", cfg.ssid,
+                  WiFi.localIP().toString().c_str(), hostActive);
+    startMdns();
+    if (cfg.ntp) ntpStart();
+  } else if (!up && wasConnected) {
+    Serial.println("wifi: disconnected");
+  }
+  wasConnected = up;
+
+  if (up) {
+    lastConnectedMs = now;
+    if (apActive) {
+      // Keep the hotspot open a little so the setup page can show the new address.
+      uint32_t since = now - (connectedSinceMs > apStartedMs ? connectedSinceMs : apStartedMs);
+      uint32_t grace = apManual ? 600000 : 60000;
+      if ((since > grace && WiFi.softAPgetStationNum() == 0) || since > 900000) stopAP();
+    }
+    return;
+  }
+
+  uint32_t lostFor = now - lastConnectedMs;
+  if (!apActive && (cfg.ssid[0] == 0 || lostFor > (everConnected ? AP_AFTER_DROPOUT_MS : AP_AFTER_BOOT_MS)) &&
+      (apFailedMs == 0 || now - apFailedMs > 60000)) {
+    startAP(false);
+  }
+  // A connection attempt scans channels and briefly disturbs the hotspot, so
+  // retry rarely while someone is on it (but do retry: a phone that stays
+  // joined must not keep the clock off the home network forever).
+  uint32_t retry = !apActive ? STA_RETRY_MS : WiFi.softAPgetStationNum() ? STA_RETRY_BUSY_MS : STA_RETRY_AP_MS;
+  if (cfg.ssid[0] && now - lastStaAttemptMs > retry && (int32_t)(now - retryNotBeforeMs) >= 0) {
+    staBegin();
+  }
+}
+
+static void setWifi(const char *ssid, const char *pass) {
+  copyStr(cfg.ssid, sizeof(cfg.ssid), ssid);
+  copyStr(cfg.pass, sizeof(cfg.pass), pass);
+  saveStr("ssid", cfg.ssid);
+  saveStr("pass", cfg.pass);
+  lastDisconnectReason = 0;
+  WiFi.disconnect();
+  staBegin();
+}
+
+// --------------------------------------------------------------- LED/button
+
+static void ledWrite(int r, int g, int b) {
+#if LED_PIN >= 0
+#if LED_RGB
+  rgbLedWrite(LED_PIN, r, g, b);
+#else
+  bool on = (r | g | b) != 0;
+  digitalWrite(LED_PIN, (on != (LED_ACTIVE_LOW != 0)) ? HIGH : LOW);
+#endif
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+#endif
+}
+
+static bool buttonHeld __attribute__((unused)) = false;
+
+static void ledLoop() {
+#if LED_PIN >= 0
+  static uint32_t last = 0xffffffff;
+  uint32_t now = millis();
+  uint32_t color = 0;  // 0xRRGGBB, kept dim
+  if (buttonHeld) {
+    color = 0x000030;
+  } else if (apActive) {
+    color = ((now / (LED_RGB ? 500 : 125)) & 1) ? 0x000030 : 0;  // setup hotspot: blue blink
+  } else if (!cfg.led) {
+    color = 0;
+  } else if (radioOn) {
+    color = carrierHigh ? 0x003000 : 0;  // follows the modulation
+  } else if (cfg.tx) {
+    color = ((now / 1000) & 1) ? 0x302000 : 0;  // waiting for the time: slow amber blink
+  }
+  if (color != last) {
+    last = color;
+    ledWrite((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+  }
+#endif
+}
+
+static void buttonLoop() {
+#if BUTTON_PIN >= 0
+  static bool stable = false, lastRaw = false, longDone = false;
+  static uint32_t changedAt = 0, pressedAt = 0;
+  uint32_t now = millis();
+  bool raw = digitalRead(BUTTON_PIN) == LOW;
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    changedAt = now;
+  }
+  if (raw != stable && now - changedAt >= 50) {
+    stable = raw;
+    if (stable) {
+      pressedAt = now;
+      longDone = false;
+    } else if (now - pressedAt < 1000) {  // 1-3 s: released while the LED showed blue, ignore
+      setTx(!cfg.tx);
+      Serial.printf("button: TX %s\n", cfg.tx ? "on" : "off");
+    }
+  }
+  if (stable && !longDone && now - pressedAt >= 3000) {
+    longDone = true;
+    startAP(true);
+  }
+  buttonHeld = stable && now - pressedAt >= 1000;
+#endif
+}
+
+// ----------------------------------------------------------------- self-test
+
+static volatile uint32_t measCount = 0;
+
+static void IRAM_ATTR onMeasEdge() {
+  measCount = measCount + 1;
+}
+
+// Jumper the radio pin to MEAS_PIN and count carrier edges for 200 ms.
+static String selfTest() {
+  if (MEAS_PIN < 0 || MEAS_PIN == cfg.pin) return String("no measurement pin available");
+  if (!radioOn) return String("carrier is off; turn TX on first");
+  pinMode(MEAS_PIN, INPUT_PULLDOWN);
+  measCount = 0;
+  forceCarrier = true;
+  attachInterrupt(digitalPinToInterrupt(MEAS_PIN), onMeasEdge, RISING);
+  delay(200);
+  detachInterrupt(digitalPinToInterrupt(MEAS_PIN));
+  forceCarrier = false;
+  pinMode(MEAS_PIN, INPUT);
+  uint32_t hz = measCount * 5;
+  uint32_t expected = tc_stations[radioStation].freq_hz;
+  if (hz == 0) {
+    return String("no edges on GPIO ") + MEAS_PIN + " (is it jumpered to GPIO " + radioPin + "?); LEDC reports " +
+           ledc_get_freq(LEDC_MODE, LEDC_TIMER) + " Hz, expected " + expected + " Hz";
+  }
+  return String("measured ~") + hz + " Hz on GPIO " + MEAS_PIN + ", expected " + expected + " Hz";
+}
+
+// ------------------------------------------------------------- status/text
+
+static const char *radioState() {
+  if (radioOn) return "transmitting";
+  if (cfg.tx) return "waiting";
+  return "off";
+}
+
+static String statusText() {
+  time_t now = time(NULL);
+  const tc_station &st = tc_stations[cfg.station];
   String s;
-  s.reserve(512);
-  // Capture current time at generation
-  getlocaltime();
-  s += "clocksync v"; s += VERSION; s += "\n\n";
-  s += "Status:\n";
-  s += "  Station : "; s += stationNames[currentStation]; s += "\n";
-  s += "  TX      : "; s += (txEnabled ? "enabled" : "disabled"); s += "\n";
-  int chz = radiodiv * 500;
-  s += "  Carrier : "; s += String(chz); s += " Hz ("; s += String((float)chz / 1000.0f, 1); s += " kHz)\n";
-  s += "  Pin     : GPIO "; s += String(pinRadio); s += "\n";
-  s += "  Drive   : "; s += String(driveStrength); s += " (0=weak,3=strong)\n";
-  s += "  NTP     : "; s += (ntpsync ? "on" : "off"); s += "\n";
-  s += "  TZ      : "; s += TZ; s += "\n";
-  s += "  Buzzer  : "; s += (buzzsw ? "on" : "off"); s += "\n";
-  s += "  LED     : "; s += (ledEnabled ? "on" : "off"); s += "\n";
-  s += "  DST ov  : "; s += (dstOverride==2?"auto":(dstOverride?"DST":"STD")); s += " (DCF/MSF only; WWVB uses TZ-derived DST)\n";
-  s += "  WWVB    : txtempus framing; time=UTC; DST bits from TZ ("; s += TZ; s += ").\n";
-  char tbuf[48];
-  snprintf(tbuf, sizeof(tbuf), "  Now     : %04d-%02d-%02d %02d:%02d:%02d (local)\n",
-           nowtm.tm_year + 1900, nowtm.tm_mon + 1, nowtm.tm_mday,
-           nowtm.tm_hour, nowtm.tm_min, nowtm.tm_sec);
-  s += tbuf;
-  s += "\nCommands:\n";
-  s += "  h           : show this help\n";
-  s += "  e0|e1       : TX disable/enable (stop/start carrier + modulation)\n";
-  s += "  y0|y1       : NTP sync off/on\n";
-  s += "  dYYMMDD     : set date (interpreted in local TZ)\n";
-  s += "  tHHmmSS     : set time and restart tick (local TZ)\n";
-  s += "  z0|z1       : buzzer off/on\n";
-  s += "  l0|l1       : LED off/on\n";
-  s += "  pNN         : set radio output pin (e.g., p25)\n";
-  s += "  g0|g1|g2|g3 : set GPIO drive (0=weakest,3=strongest)\n";
-  s += "  f           : self-test: jumper radio pin to GPIO33, measure carrier\n";
-  s += "  n0|n1       : (WWVB) legacy framing toggle — ignored; always txtempus framing\n";
-  s += "  x0|x1|x2    : force DST STD/DST/AUTO (DCF/MSF only; WWVB uses TZ)\n";
-  s += "  sX          : set station to X (one of):\n";
-  for (int i = 0; i < 7; i++) {
-    s += "    s"; s += stationCmds[i]; s += " : "; s += stationNames[i]; s += "\n";
+  s.reserve(900);
+  s += "clocksync v" VERSION " (" BOARD_NAME ")\n\n";
+  s += "Station : ";
+  s += st.name;
+  s += " - ";
+  s += st.region;
+  s += "\nTX      : ";
+  s += cfg.tx ? (radioOn ? "on, transmitting" : "on, waiting for the time to be set") : "off";
+  s += "\nCarrier : ";
+  s += st.freq_hz;
+  s += " Hz on GPIO ";
+  s += cfg.pin;
+  s += ", drive ";
+  s += cfg.drive;
+  s += "\nTime    : ";
+  s += timeValid() ? fmtLocal(now) : String("not set");
+  s += "\nZone    : ";
+  s += effectiveTzName();
+  s += cfg.tzName[0] ? "" : " (station default)";
+  s += " = ";
+  s += effectivePosix();
+  if (st.encodes_utc) s += "\n          WWVB sends UTC; the zone only sets the DST bits";
+  s += "\nDST flag: ";
+  s += cfg.dstMode == TC_DST_AUTO ? "auto" : (cfg.dstMode == TC_DST_SUMMER ? "forced summer" : "forced standard");
+  s += "\nNTP     : ";
+  if (cfg.ntp) {
+    s += cfg.ntpServer;
+    s += ", last sync ";
+    s += ageText(lastNtpSync);
+  } else {
+    s += "off";
   }
+  s += "\nWi-Fi   : ";
+  if (connected()) {
+    s += "\"";
+    s += cfg.ssid;
+    s += "\" ";
+    s += WiFi.localIP().toString();
+    s += " (";
+    s += WiFi.RSSI();
+    s += " dBm)";
+  } else if (cfg.ssid[0]) {
+    s += "not connected to \"";
+    s += cfg.ssid;
+    s += "\" ";
+    s += wifiError();
+  } else {
+    s += "not configured";
+  }
+  if (apActive) {
+    s += "\nHotspot : \"";
+    s += apSsid();
+    s += "\" http://";
+    s += AP_IP.toString();
+    s += "/";
+  }
+  s += "\nWeb UI  : http://";
+  s += hostActive;
+  s += ".local/";
+  String f = frameString();
+  if (f.length()) {
+    s += "\nFrame   : ";
+    s += f;
+  }
+  s += "\n";
   return s;
 }
 
-void handleStatus(void) {
-  String s = generateStatusText();
-  server.send(200, "text/plain", s);
+static const char HELP_TEXT[] =
+  "\nCommands (serial or http://<device>/cmd?c=...):\n"
+  "  h / status   : help and status\n"
+  "  sX           : station: sj JJY40, sk JJY60, sw WWVB, sd DCF77, sm MSF, st BSF, sc BPC\n"
+  "  e1 / e0      : transmit on / off\n"
+  "  tz<zone>     : time zone, e.g. tzEurope/Berlin, tz<POSIX rule>, or tz alone for the station's own\n"
+  "  x0 / x1 / x2 : DST flag standard / summer / auto\n"
+  "  y1 / y0      : NTP on / off\n"
+  "  ss<name>     : Wi-Fi network name\n"
+  "  ps<password> : Wi-Fi password, then connect\n"
+  "  setup        : open the Wi-Fi setup hotspot\n"
+  "  pNN          : antenna GPIO pin\n"
+  "  g0..g3       : drive strength (0 weakest)\n"
+  "  l1 / l0      : status LED on / off\n"
+  "  dYYMMDD      : set date (local)\n"
+  "  tHHMMSS      : set time (local)\n"
+  "  f            : frequency self-test (jumper antenna pin to the measurement pin)\n"
+  "  r            : reset settings to defaults (keeps Wi-Fi)\n"
+  "  reboot       : restart\n";
+
+// ------------------------------------------------------------------ commands
+
+static int twoDigits(const char *p) {
+  if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1])) return -1;
+  return (p[0] - '0') * 10 + (p[1] - '0');
 }
 
-void handleCmd(void) {
-  if (!server.hasArg("c")) {
-    server.send(400, "text/plain", "missing c param\n");
-    return;
+static bool allDigits(const char *p) {
+  if (!*p) return false;
+  for (; *p; p++) {
+    if (!isdigit((unsigned char)*p)) return false;
   }
-  String arg = server.arg("c");
-  if (arg.length() == 0 || arg.length() >= 127) {
-    server.send(400, "text/plain", "bad c param\n");
-    return;
+  return true;
+}
+
+static void resetSettings() {
+  static const char *const keys[] = { "station", "tx", "pin", "drive", "led", "ntp2", "dst", "tzname", "tz", "ntpsrv" };
+  for (const char *k : keys) prefs.remove(k);
+  if (radioOn) radioStop();
+  pinHighZ(cfg.pin);
+  Settings d;
+  defaultSettings(d);
+  memcpy(d.ssid, cfg.ssid, sizeof(d.ssid));
+  memcpy(d.pass, cfg.pass, sizeof(d.pass));
+  memcpy(d.host, cfg.host, sizeof(d.host));
+  cfg = d;
+  applyTimeZone();
+  if (cfg.ntp && connected()) ntpStart();
+}
+
+static void scheduleReboot() {
+  rebootPending = true;
+  rebootAtMs = millis() + 500;
+}
+
+// Runs one command; returns false for unknown or invalid commands.
+static bool runCommand(const char *c, String &reply) {
+  size_t n = strlen(c);
+  if (n == 0) return false;
+  char c0 = (char)tolower((unsigned char)c[0]);
+  char c1 = n > 1 ? (char)tolower((unsigned char)c[1]) : 0;
+
+  if (strcmp(c, "h") == 0 || strcmp(c, "help") == 0) {
+    reply = statusText() + HELP_TEXT;
+    return true;
   }
-  char buf[128];
-  memcpy(buf, arg.c_str(), arg.length());
-  buf[arg.length()] = '\0';
-  int ok = docmd(buf);
-  String s;
-  if (ok) {
-    s = String("OK\n");
-    if (lastCmdResp.length() > 0) {
-      s += lastCmdResp;
-      lastCmdResp = String();
+  if (strcmp(c, "status") == 0) {
+    reply = statusText();
+    return true;
+  }
+  if (strcmp(c, "reboot") == 0) {
+    reply = "rebooting\n";
+    scheduleReboot();
+    return true;
+  }
+  if (strcmp(c, "setup") == 0) {
+    startAP(true);
+    reply = String("setup hotspot \"") + apSsid() + "\" at http://" + AP_IP.toString() + "/\n";
+    return true;
+  }
+  if (c0 == 's' && c1 == 's') {  // Wi-Fi SSID
+    if (n - 2 >= sizeof(cfg.ssid)) return false;
+    copyStr(cfg.ssid, sizeof(cfg.ssid), c + 2);
+    saveStr("ssid", cfg.ssid);
+    reply = "SSID saved; now send ps<password> (or ps alone for an open network)\n";
+    return true;
+  }
+  if (c0 == 'p' && c1 == 's') {  // Wi-Fi password, then connect
+    if (n - 2 >= sizeof(cfg.pass) || cfg.ssid[0] == 0) return false;
+    setWifi(cfg.ssid, c + 2);
+    reply = String("connecting to \"") + cfg.ssid + "\"\n";
+    return true;
+  }
+  if (c0 == 't' && c1 == 'z') {  // time zone
+    const char *z = c + 2;
+    String err;
+    bool ok;
+    char rule[64];
+    if (*z == 0 || strcmp(z, "auto") == 0) {
+      ok = setTimeZone("", "", err);
+    } else if (tzLookup(z, rule, sizeof(rule))) {
+      ok = setTimeZone(z, "", err);
+    } else {
+      ok = setTimeZone("custom", z, err);
     }
-  } else {
-    s = String("ERR\n");
+    reply = ok ? String("time zone: ") + effectiveTzName() + " = " + effectivePosix() + "\n" : err + "\n";
+    return ok;
   }
-  server.send(200, "text/plain", s);
+  switch (c0) {
+    case 's': {  // station
+      int s = n == 2 ? tc_station_by_cmd(c1) : -1;
+      if (s < 0) return false;
+      setStation(s);
+      reply = String("station: ") + tc_stations[s].name + "\n";
+      return true;
+    }
+    case 'e':  // transmit on/off
+      if (n != 2 || (c1 != '0' && c1 != '1')) return false;
+      setTx(c1 == '1');
+      reply = cfg.tx ? "TX enabled\n" : "TX disabled\n";
+      return true;
+    case 'p': {  // antenna pin
+      if (!allDigits(c + 1) || n > 3) return false;
+      int p = atoi(c + 1);
+      if (!pinAllowed(p)) {
+        reply = "pin not allowed on this board\n";
+        return false;
+      }
+      setPin(p);
+      reply = String("radio pin: GPIO ") + p + "\n";
+      return true;
+    }
+    case 'g':  // drive strength
+      if (n != 2 || c1 < '0' || c1 > '3') return false;
+      setDrive(c1 - '0');
+      reply = String("drive strength: ") + cfg.drive + "\n";
+      return true;
+    case 'y':  // NTP
+      if (n != 2 || (c1 != '0' && c1 != '1')) return false;
+      setNtp(c1 == '1');
+      reply = cfg.ntp ? "NTP on\n" : "NTP off\n";
+      return true;
+    case 'l':  // LED
+      if (n != 2 || (c1 != '0' && c1 != '1')) return false;
+      setLed(c1 == '1');
+      reply = cfg.led ? "LED on\n" : "LED off\n";
+      return true;
+    case 'x':  // DST flag mode
+      if (n != 2 || c1 < '0' || c1 > '2') return false;
+      setDstMode(c1 - '0');
+      reply = String("DST flag: ") + (cfg.dstMode == TC_DST_AUTO ? "auto" : cfg.dstMode ? "summer" : "standard") + "\n";
+      return true;
+    case 'd':
+    case 't': {  // dYYMMDD / tHHMMSS in local time
+      if (n != 7) return false;
+      int a = twoDigits(c + 1), b = twoDigits(c + 3), d = twoDigits(c + 5);
+      if (a < 0 || b < 0 || d < 0) return false;
+      time_t now = time(NULL);
+      struct tm lt;
+      localtime_r(&now, &lt);
+      if (c0 == 'd') {
+        if (b < 1 || b > 12 || d < 1 || d > 31) return false;
+        lt.tm_year = a + 100;
+        lt.tm_mon = b - 1;
+        lt.tm_mday = d;
+      } else {
+        if (a > 23 || b > 59 || d > 59) return false;
+        lt.tm_hour = a;
+        lt.tm_min = b;
+        lt.tm_sec = d;
+      }
+      lt.tm_isdst = -1;
+      setClock(mktime(&lt), 0);
+      reply = String("time: ") + fmtLocal(time(NULL)) + "\n";
+      return true;
+    }
+    case 'f':
+      if (n != 1) return false;
+      reply = selfTest() + "\n";
+      return true;
+    case 'r':
+      if (n != 1) return false;
+      resetSettings();
+      reply = "settings reset to defaults (Wi-Fi kept)\n";
+      return true;
+  }
+  return false;
 }
 
-void handleRoot(void) {
-  String s;
-  s.reserve(1400);
-  s += "<!doctype html><meta charset=\"utf-8\"><title>"; s += DEVICENAME; s += "</title>";
-  s += "<style>body{font-family:monospace;white-space:pre-wrap;margin:16px;}input,button,select{font-family:monospace;}#msg,#drvmsg{margin-left:8px;color:#080}</style>";
-  s += "<h3>"; s += DEVICENAME; s += "</h3>";
-  s += "<div><form id=\"cmdform\">cmd: <input id=\"cmd\" name=\"c\" size=\"20\" autocomplete=\"off\"><button type=\"submit\">Send</button><span id=\"msg\"></span></form></div>";
-  s += "<div style=\"margin-top:8px;\">GPIO drive (0=weak..3=strong): <select id=\"drive\"><option value=\"0\">0 (weakest)</option><option value=\"1\">1</option><option value=\"2\">2</option><option value=\"3\">3 (strongest)</option></select> <button id=\"setDrive\" type=\"button\">Apply</button><span id=\"drvmsg\"></span></div>";
-  s += "<hr><div><a href=\"/status.txt\" target=\"_blank\">status.txt</a></div><pre id=\"status\">";
-  s += generateStatusText();
-  s += "</pre><script>(function(){\n";
-  s += "function fetchStatus(){return fetch('/status.txt',{cache:'no-store'}).then(r=>r.text()).then(t=>{document.getElementById('status').textContent=t;});}\n";
-  s += "document.getElementById('cmdform').addEventListener('submit',function(ev){ev.preventDefault();var i=document.getElementById('cmd');var m=document.getElementById('msg');m.textContent='';var v=i.value.trim();if(!v){return;}fetch('/cmd?c='+encodeURIComponent(v)).then(r=>r.text()).then(t=>{m.style.color=(t.indexOf('OK')===0)?'#080':'#a00';m.textContent=t.trim();i.select();return fetchStatus();}).catch(()=>{m.style.color='#a00';m.textContent='ERR';});});\n";
-  s += "var driveSel=document.getElementById('drive');driveSel.value='"; s += driveStrength; s += "';\n";
-  s += "document.getElementById('setDrive').addEventListener('click',function(ev){ev.preventDefault();var dmsg=document.getElementById('drvmsg');dmsg.textContent='';fetch('/cmd?c=g'+encodeURIComponent(driveSel.value)).then(r=>r.text()).then(t=>{var ok=(t.indexOf('OK')===0);dmsg.style.color=ok?'#080':'#a00';dmsg.textContent=ok?'updated':'ERR';return ok?fetchStatus():null;}).catch(()=>{dmsg.style.color='#a00';dmsg.textContent='ERR';});});\n";
-  // No periodic refresh to minimize WiFi usage
-  s += "})();</script>";
-  s += "</div></body></html>";
-  server.send(200, "text/html", s);
+static void serialLoop() {
+  static char buf[160];
+  static size_t len = 0;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      buf[len] = 0;
+      if (len) {
+        String reply;
+        bool ok = runCommand(buf, reply);
+        Serial.print(ok ? "OK\n" : "ERR (h for help)\n");
+        Serial.print(reply);
+      }
+      len = 0;
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = ch;
+    }
+  }
 }
 
-void setupWebServer(void) {
-  server.on("/", handleRoot);
-  server.on("/status.txt", HTTP_GET, handleStatus);
+// ---------------------------------------------------------------------- HTTP
+
+static void jsonStr(String &o, const char *s) {
+  o += '"';
+  for (; *s; s++) {
+    char c = *s;
+    if (c == '"' || c == '\\') {
+      o += '\\';
+      o += c;
+    } else if ((uint8_t)c < 0x20) {
+      char b[8];
+      snprintf(b, sizeof(b), "\\u%04x", c);
+      o += b;
+    } else {
+      o += c;
+    }
+  }
+  o += '"';
+}
+
+static void jsonKey(String &o, const char *k) {
+  if (o.length() > 1) o += ',';
+  jsonStr(o, k);
+  o += ':';
+}
+
+static void jsonKV(String &o, const char *k, const char *v) {
+  jsonKey(o, k);
+  jsonStr(o, v);
+}
+
+static void jsonKV(String &o, const char *k, long v) {
+  jsonKey(o, k);
+  o += v;
+}
+
+static void jsonKV(String &o, const char *k, bool v) {
+  jsonKey(o, k);
+  o += v ? "true" : "false";
+}
+
+static String statusJson() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  time_t now = tv.tv_sec;
+  struct tm lt;
+  localtime_r(&now, &lt);
+  char abbr[16];
+  strftime(abbr, sizeof(abbr), "%Z", &lt);
+  long offset = utcOffsetAt(now);
+
+  String o;
+  o.reserve(1800);
+  o += '{';
+  jsonKV(o, "ok", true);
+  jsonKV(o, "version", VERSION);
+  jsonKV(o, "board", BOARD_NAME);
+  jsonKV(o, "host", hostActive);
+  jsonKV(o, "hostSaved", cfg.host);
+  jsonKV(o, "uptime", (long)(millis() / 1000));
+  jsonKey(o, "ms");
+  char ms[24];
+  snprintf(ms, sizeof(ms), "%lld", (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+  o += ms;
+  jsonKV(o, "timeValid", timeValid());
+  jsonKV(o, "station", tc_stations[cfg.station].key);
+  jsonKV(o, "tx", cfg.tx);
+  jsonKV(o, "state", radioState());
+  jsonKV(o, "freq", (long)tc_stations[cfg.station].freq_hz);
+  jsonKV(o, "ledcHz", radioOn ? (long)ledc_get_freq(LEDC_MODE, LEDC_TIMER) : 0L);
+  jsonKV(o, "tz", cfg.tzName);
+  jsonKV(o, "tzEff", effectiveTzName());
+  jsonKV(o, "posix", effectivePosix());
+  jsonKV(o, "offset", offset);
+  jsonKV(o, "isDst", lt.tm_isdst > 0);
+  jsonKV(o, "abbr", abbr);
+  jsonKV(o, "dstMode", (long)cfg.dstMode);
+  jsonKV(o, "ntp", cfg.ntp);
+  jsonKV(o, "ntpServer", cfg.ntpServer);
+  jsonKV(o, "lastSync", lastNtpSync ? (long)(now - lastNtpSync) : -1L);
+  jsonKV(o, "pin", (long)cfg.pin);
+  jsonKey(o, "pins");
+  o += '[';
+  bool first = true;
+  for (int p : SAFE_PIN_LIST) {
+    if (!first) o += ',';
+    o += p;
+    first = false;
+  }
+  o += ']';
+  jsonKV(o, "drive", (long)cfg.drive);
+  jsonKV(o, "led", cfg.led);
+  jsonKV(o, "measPin", (long)MEAS_PIN);
+  jsonKV(o, "frame", frameString().c_str());
+
+  bool up = connected();
+  jsonKey(o, "wifi");
+  String w = "{";
+  jsonKV(w, "ssid", cfg.ssid);
+  jsonKV(w, "connected", up);
+  jsonKV(w, "connecting", !up && cfg.ssid[0] && millis() - lastStaAttemptMs < 15000);
+  jsonKV(w, "error", up ? "" : wifiError());
+  jsonKV(w, "ip", up ? WiFi.localIP().toString().c_str() : "");
+  jsonKV(w, "rssi", up ? (long)WiFi.RSSI() : 0L);
+  jsonKV(w, "ap", apActive);
+  jsonKV(w, "apSsid", apSsid().c_str());
+  jsonKV(w, "apIp", AP_IP.toString().c_str());
+  w += '}';
+  o += w;
+
+  jsonKey(o, "stations");
+  o += '[';
+  for (int i = 0; i < TC_STATION_COUNT; i++) {
+    const tc_station &st = tc_stations[i];
+    String e = "{";
+    jsonKV(e, "key", st.key);
+    jsonKV(e, "name", st.name);
+    jsonKV(e, "region", st.region);
+    jsonKV(e, "freq", (long)st.freq_hz);
+    jsonKV(e, "tz", st.native_tz);
+    jsonKV(e, "utc", st.encodes_utc != 0);
+    jsonKey(e, "shapes");  // carrier envelope per symbol, for the UI's signal trace
+    e += '[';
+    for (int k = 0; k < TC_SYM_COUNT; k++) {
+      if (k) e += ',';
+      jsonStr(e, tc_shape(i, (uint8_t)k));
+    }
+    e += ']';
+    e += '}';
+    if (i) o += ',';
+    o += e;
+  }
+  o += ']';
+  o += '}';
+  return o;
+}
+
+static void sendJson(int code, const String &body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(code, "application/json", body);
+}
+
+static void sendError(int code, const String &msg) {
+  String o = "{";
+  jsonKV(o, "ok", false);
+  jsonKV(o, "error", msg.c_str());
+  o += '}';
+  sendJson(code, o);
+}
+
+static void sendOk() {
+  sendJson(200, "{\"ok\":true}");
+}
+
+// State-changing API calls must carry this header. Browsers cannot add it to
+// cross-site requests without a CORS preflight, which we never approve.
+static bool apiAllowed() {
+  if (server.hasHeader("X-Clocksync")) return true;
+  sendError(403, "missing X-Clocksync header");
+  return false;
+}
+
+static bool isOwnHost(const String &host) {
+  String h = host;
+  int colon = h.indexOf(':');
+  if (colon >= 0) h = h.substring(0, colon);
+  h.toLowerCase();
+  if (h.length() == 0 || h == AP_IP.toString() || h == WiFi.localIP().toString()) return true;
+  return h == String(hostActive) + ".local" || h == String(hostActive);
+}
+
+// Captive portal: phones that join the hotspot probe a known URL; send those
+// requests to the setup page. Requests from the home network are left alone.
+static bool captiveRedirect() {
+  if (!apActive || !(server.client().localIP() == AP_IP) || isOwnHost(server.hostHeader())) return false;
+  server.sendHeader("Location", String("http://") + AP_IP.toString() + "/", true);
+  server.send(302, "text/plain", "");
+  return true;
+}
+
+static void handleRoot() {
+  if (captiveRedirect()) return;
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send_P(200, "text/html", WEBUI_HTML);
+}
+
+static void handleNotFound() {
+  if (captiveRedirect()) return;
+  server.send(404, "text/plain", "not found\n");
+}
+
+static void handleStatusText() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", statusText());
+}
+
+// Commands that change Wi-Fi, reset or restart need the API header. The rest
+// stay plain GETs so existing Home Assistant setups keep working.
+static bool commandNeedsHeader(const String &c) {
+  String l = c;
+  l.toLowerCase();
+  return l.startsWith("ss") || l.startsWith("ps") || l == "r" || l == "reboot" || l == "setup";
+}
+
+static void handleCmd() {
+  String c = server.arg("c");
+  if (c.length() == 0 || c.length() > 120) {
+    server.send(400, "text/plain", "ERR missing or bad c parameter\n");
+    return;
+  }
+  if (commandNeedsHeader(c) && !server.hasHeader("X-Clocksync")) {
+    server.send(403, "text/plain", "ERR this command needs the header X-Clocksync: 1\n");
+    return;
+  }
+  String reply;
+  bool ok = runCommand(c.c_str(), reply);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", String(ok ? "OK\n" : "ERR\n") + reply);
+}
+
+static void handleApiStatus() {
+  sendJson(200, statusJson());
+}
+
+static void handleApiZones() {
+  server.sendHeader("Cache-Control", "max-age=86400");
+  server.send_P(200, "text/plain", TZDATA);
+}
+
+// Integer form field; false unless it is a plain non-negative number.
+static bool argInt(const char *name, int &out) {
+  String v = server.arg(name);
+  v.trim();
+  if (v.length() == 0 || v.length() > 4 || !allDigits(v.c_str())) return false;
+  out = v.toInt();
+  return true;
+}
+
+static bool argBool(const char *name) {
+  String v = server.arg(name);
+  return v == "1" || v == "true" || v == "on";
+}
+
+static void handleApiSet() {
+  if (!apiAllowed()) return;
+  String err;
+  if (server.hasArg("station")) {
+    int s = tc_station_by_key(server.arg("station").c_str());
+    if (s < 0) err = "unknown station";
+    else setStation(s);
+  }
+  if (err.length() == 0 && server.hasArg("tz")) {
+    setTimeZone(server.arg("tz").c_str(), server.arg("posix").c_str(), err);
+  }
+  if (err.length() == 0 && server.hasArg("dst")) {
+    int d;
+    if (!argInt("dst", d) || d > 2) err = "bad dst mode";
+    else setDstMode(d);
+  }
+  if (err.length() == 0 && server.hasArg("pin")) {
+    int p;
+    if (!argInt("pin", p) || !pinAllowed(p)) err = "pin not allowed on this board";
+    else setPin(p);
+  }
+  if (err.length() == 0 && server.hasArg("drive")) {
+    int d;
+    if (!argInt("drive", d) || d > 3) err = "bad drive strength";
+    else setDrive(d);
+  }
+  if (err.length() == 0 && server.hasArg("ntpServer")) {
+    String s = server.arg("ntpServer");
+    s.trim();
+    if (!validServer(s.c_str())) err = "bad NTP server name";
+    else setNtpServer(s.c_str());
+  }
+  if (err.length() == 0 && server.hasArg("ntp")) setNtp(argBool("ntp"));
+  if (err.length() == 0 && server.hasArg("led")) setLed(argBool("led"));
+  if (err.length() == 0 && server.hasArg("tx")) setTx(argBool("tx"));
+  if (err.length() == 0 && server.hasArg("host")) {
+    String h = server.arg("host");
+    h.trim();
+    h.toLowerCase();
+    if (!validHostname(h.c_str())) {
+      err = "name: up to 26 of a-z, 0-9 and -";
+    } else {
+      copyStr(cfg.host, sizeof(cfg.host), h.c_str());
+      saveStr("host", cfg.host);  // used after the next restart
+    }
+  }
+  if (err.length()) {
+    sendError(400, err);
+    return;
+  }
+  radioLoop();  // apply immediately so the response shows the new state
+  sendJson(200, statusJson());
+}
+
+static void handleApiScan() {
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    sendJson(200, "{\"ok\":true,\"scanning\":true}");
+    return;
+  }
+  if (n < 0 || server.hasArg("start")) {
+    WiFi.scanDelete();
+    if (!connected()) WiFi.disconnect();  // a pending connection attempt blocks scanning
+    retryNotBeforeMs = millis() + 15000;  // and hold off retries while it runs
+    WiFi.scanNetworks(true);
+    sendJson(200, "{\"ok\":true,\"scanning\":true}");
+    return;
+  }
+  String o = "{\"ok\":true,\"networks\":[";
+  int count = 0;
+  for (int i = 0; i < n && count < 30; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    bool dup = false;  // one entry per name, strongest first
+    for (int j = 0; j < i && !dup; j++) dup = WiFi.SSID(j) == ssid && WiFi.RSSI(j) >= WiFi.RSSI(i);
+    if (dup) continue;
+    String e = "{";
+    jsonKV(e, "ssid", ssid.c_str());
+    jsonKV(e, "rssi", (long)WiFi.RSSI(i));
+    jsonKV(e, "open", WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    e += '}';
+    if (count++) o += ',';
+    o += e;
+  }
+  o += "]}";
+  sendJson(200, o);
+}
+
+static void handleApiWifi() {
+  if (!apiAllowed()) return;
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  if (ssid.length() == 0 || ssid.length() >= sizeof(cfg.ssid)) {
+    sendError(400, "network name must be 1-32 characters");
+    return;
+  }
+  if (pass.length() >= sizeof(cfg.pass) || (pass.length() > 0 && pass.length() < 8)) {
+    sendError(400, "password must be 8-63 characters (or empty for an open network)");
+    return;
+  }
+  setWifi(ssid.c_str(), pass.c_str());
+  sendOk();
+}
+
+static void handleApiTime() {
+  if (!apiAllowed()) return;
+  long long ms = atoll(server.arg("ms").c_str());
+  if (ms < (long long)VALID_TIME * 1000) {
+    sendError(400, "bad time");
+    return;
+  }
+  setClock((time_t)(ms / 1000), (long)(ms % 1000) * 1000);
+  sendJson(200, statusJson());
+}
+
+static void handleApiSetup() {
+  if (!apiAllowed()) return;
+  startAP(true);
+  sendOk();
+}
+
+static void handleApiReboot() {
+  if (!apiAllowed()) return;
+  sendOk();
+  scheduleReboot();
+}
+
+static void handleApiForget() {
+  if (!apiAllowed()) return;
+  cfg.ssid[0] = 0;
+  cfg.pass[0] = 0;
+  saveStr("ssid", "");
+  saveStr("pass", "");
+  sendOk();
+  scheduleReboot();
+}
+
+static void handleApiReset() {
+  if (!apiAllowed()) return;
+  resetSettings();
+  sendJson(200, statusJson());
+}
+
+static void webSetup() {
+  static const char *headers[] = { "X-Clocksync" };
+  server.collectHeaders(headers, 1);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status.txt", HTTP_GET, handleStatusText);
   server.on("/cmd", HTTP_GET, handleCmd);
-  
-
-  server.onNotFound([](){ server.send(404, "text/plain", "not found\n"); });
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/zones", HTTP_GET, handleApiZones);
+  server.on("/api/scan", HTTP_GET, handleApiScan);
+  server.on("/api/set", HTTP_POST, handleApiSet);
+  server.on("/api/wifi", HTTP_POST, handleApiWifi);
+  server.on("/api/time", HTTP_POST, handleApiTime);
+  server.on("/api/setup", HTTP_POST, handleApiSetup);
+  server.on("/api/reboot", HTTP_POST, handleApiReboot);
+  server.on("/api/forget", HTTP_POST, handleApiForget);
+  server.on("/api/reset", HTTP_POST, handleApiReset);
+  server.onNotFound(handleNotFound);
   server.begin();
-  if (WiFi.status() == WL_CONNECTED) {
-    // Note: MDNS.begin(DEVICENAME) is called explicitly in setup().
-    // We just need to add the service here.
-    MDNS.begin(DEVICENAME);
-    MDNS.addService("http", "tcp", 80);
-    LOG_PRINTF("HTTP server: http://%s.local/\n", DEVICENAME);
-  } else {
-    LOG_PRINTLN("HTTP server started (WiFi not connected yet)");
-  }
 }
 
+// --------------------------------------------------------------------- main
 
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\nclocksync v" VERSION " (" BOARD_NAME ")");
 
-void ntpstart(void) {
-  int i;
+#if LED_PIN >= 0 && !LED_RGB
+  pinMode(LED_PIN, OUTPUT);
+#endif
+  ledWrite(0, 0, 0);
+#if BUTTON_PIN >= 0
+  pinMode(BUTTON_PIN, BUTTON_PULLUP ? INPUT_PULLUP : INPUT);
+#endif
 
-  // WiFi, NTP setup
-  LOG_PRINT("Attempting to connect to Network named: ");
-  LOG_PRINTLN(ssid);  // print the network name (SSID);
-  WiFi.begin(ssid, passwd);
-  for (i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++) {
-    LOG_PRINT(".");
-    delay(1000);
-  }
-  if (i == 10) {
-    ntpsync = 0;
-    return;
-  }
-  IPAddress ip = WiFi.localIP();
-  LOG_PRINTF("IP Address: ");
-  LOG_PRINTLN(ip);
-  LOG_PRINTF("configuring NTP timezone...");
-  // Use POSIX TZ string for automatic DST handling (see TZ macro)
-  configTzTime(TZ, "pool.ntp.org", "time.nist.gov");
-  for (int i = 0; i < 10 && !getLocalTime(&nowtm); i++) {
-    LOG_PRINTF(".");
-    delay(1000);
-  }
-  if (i == 10) {
-    ntpsync = 0;
-    return;
-  }
-  LOG_PRINTF("done\n");
+  loadSettings();
+  copyStr(hostActive, sizeof(hostActive), cfg.host);
+  radioSetup();
+  applyTimeZone();
+  wifiSetup();
+  webSetup();
+  Serial.println("Type h + Enter for help.");
 }
 
+void loop() {
+  serialLoop();
+  buttonLoop();
+  wifiLoop();
+  if (apActive) dns.processNextRequest();
+  server.handleClient();
+  radioLoop();
+  ledLoop();
 
-void ntpstop(void) {
-  ntpsync = 0;
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-}
-
-
-void setlocaltime(void) {
-  time_t nowtime = mktime(&nowtm) /*+ TZ */;
-  struct timeval tv = {
-    .tv_sec = nowtime
-  };
-  settimeofday(&tv, NULL);
-  getlocaltime();  // to make wday/yday
-}
-
-
-void getlocaltime(void) {
-  if (ntpsync) {
-    getLocalTime(&nowtm);
-  } else {
-    time_t nowtime;
-    time(&nowtime);
-    struct tm *ntm;
-    ntm = localtime(&nowtime);
-    nowtm = *ntm;
+  static uint32_t loggedFrame = 0;
+  if (radioOn && frameCount != loggedFrame) {
+    loggedFrame = frameCount;
+    Serial.printf("%s  %s\n", fmtLocal(time(NULL)).c_str(), frameString().c_str());
   }
-}
-
-// Allowed radio output pins on Atom Lite (avoid 12, 27, 39, bootstraps)
-int isSafeAtomPin(int p) {
-  // Common breakouts and HY2.0
-  int allowed[] = { 19, 21, 22, 23, 25, 26, 32, 33 };
-  for (unsigned i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
-    if (p == allowed[i]) {
-      return 1;
-    }
+  if (rebootPending && (int32_t)(millis() - rebootAtMs) >= 0) {
+    Serial.println("rebooting");
+    Serial.flush();
+    ESP.restart();
   }
-  return 0;
-}
-
-int clampDriveCap(int cap) {
-  if (cap < (int)GPIO_DRIVE_CAP_0) return GPIO_DRIVE_CAP_0;
-  if (cap > (int)GPIO_DRIVE_CAP_3) return GPIO_DRIVE_CAP_3;
-  return cap;
-}
-
-void applyDriveStrength(void) {
-  driveStrength = clampDriveCap(driveStrength);
-  gpio_set_drive_capability((gpio_num_t)pinRadio, (gpio_drive_cap_t)driveStrength);
-}
-
-// ------------------------- Persistence (Preferences) -------------------------
-void saveSettings(void) {
-  prefs.begin("clocksync", false);
-  prefs.putInt("station", currentStation);
-  prefs.putInt("tx", txEnabled);
-  prefs.putInt("pin", pinRadio);
-  prefs.putInt("ntp", ntpsync);
-  prefs.putInt("buzz", buzzsw);
-  prefs.putInt("dst", dstOverride);
-
-  prefs.putInt("led", ledEnabled);
-  prefs.putInt("drive", driveStrength);
-  prefs.end();
-}
-
-void loadSettings(void) {
-  prefs.begin("clocksync", true);
-  int v;
-  v = prefs.getInt("station", -1);
-  if (v >= 0 && v <= SN_BPC) {
-    currentStation = v;
-  }
-  v = prefs.getInt("tx", -1);
-  if (v == 0 || v == 1) {
-    txEnabled = v;
-  }
-  v = prefs.getInt("pin", -1);
-  if (v >= 0 && isSafeAtomPin(v)) {
-    pinRadio = v;
-  }
-  v = prefs.getInt("ntp", -1);
-  if (v == 0 || v == 1) {
-    ntpsync = v;
-  }
-  v = prefs.getInt("buzz", -1);
-  if (v == 0 || v == 1) {
-    buzzsw = v;
-  }
-  v = prefs.getInt("dst", -1);
-  if (v == 0 || v == 1 || v == 2) {
-    dstOverride = v;
-  }
-  v = prefs.getInt("led", -1);
-  if (v == 0 || v == 1) {
-    ledEnabled = v;
-  }
-  v = prefs.getInt("drive", -1);
-  if (v >= GPIO_DRIVE_CAP_0 && v <= GPIO_DRIVE_CAP_3) {
-    driveStrength = v;
-  }
-  prefs.end();
-}
-
-void applyDefaultSettings(void) {
-  // Reset radio pin if changed
-  int defaultPin = PIN_RADIO;
-  if (pinRadio != defaultPin) {
-    stoptimer();
-    pinMode(pinRadio, INPUT);      // tristate old pin (Hi-Z)
-    pinRadio = defaultPin;
-    pinMode(pinRadio, OUTPUT);
-    digitalWrite(pinRadio, LOW);   // new pin ready for LEDC
-  }
-  driveStrength = GPIO_DRIVE_CAP_2;
-  applyDriveStrength();
-  // Defaults
-  txEnabled = 1;
-  buzzsw = 0;
-  dstOverride = 2;
-  // NTP default: on
-  ntpstop();
-  ntpsync = 1;
-  ntpstart();
-  // Station default
-  setstation(SN_DEFAULT);
+  delay(2);
 }
