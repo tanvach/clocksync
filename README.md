@@ -6,16 +6,21 @@
 
 This project is a maintained fork of `nisejjy` by SASAKI Taroh, customized for modern hardware (M5 Atom Lite, ESP32, ESP32-C3, ESP32-S3).
 
+**[Install from the browser](https://tanvach.github.io/clocksync/)** · **[v2.0.0 release](https://github.com/tanvach/clocksync/releases/tag/v2.0.0)** · [All releases](https://github.com/tanvach/clocksync/releases)
+
+![The clocksync web UI: live clock, the signal being sent this minute, and settings](docs/images/web-ui.png)
+
 ## What's New in v2.0
 
 **Compile and go.** Nothing in the source needs editing any more.
-- **Wi-Fi setup hotspot**: on first boot (or when the saved network can't be reached) the device opens a `clocksync-setup` hotspot. Join it from a phone, the setup page opens by itself, pick your network from a scan list. Idea from the [Rmni2 fork](https://github.com/Rmni2/clocksync-esp32-c3).
+- **Wi-Fi setup hotspot**: on first boot (or when the saved network can't be reached) the device opens a `clocksync-setup` hotspot. Join it from a phone and pick your network from a scan list in the page that opens. Idea from the [Rmni2 fork](https://github.com/Rmni2/clocksync-esp32-c3).
+- **Install and update from the browser**: no IDE needed, and updates keep your settings.
 - **Time zone picker**: choose any IANA zone (Europe/Berlin, America/Denver, ...) from a list in the web UI. By default each station uses the zone its clocks expect, so DCF77 sends German time and MSF UK time without any setup.
 - **Board detection**: pins, LED and button are picked automatically for M5 Atom, AtomS3, ESP32, ESP32-C3 and ESP32-S3. The M5Atom library is no longer needed.
 - **New web UI**: live clock, a trace of the exact signal being sent, and all settings in one place, including Wi-Fi, antenna pin and NTP server.
 
 **Signal fixes.** Several stations were not being decoded correctly before:
-- **Carrier frequency**: v1.x transmitted 60 kHz for every station. JJY 40 kHz, DCF77, BSF and BPC now use their real frequency. The carrier is also more accurate (≤30 ppm instead of up to 370 ppm).
+- **Carrier frequency**: v1.x transmitted 60 kHz for every station. JJY 40 kHz, DCF77, BSF and BPC now use their real frequency. The carrier is also more accurate (within ~35 ppm instead of up to 370 ppm).
 - **MSF**: parity bits were even instead of odd, so clocks rejected every frame. MSF also announces the *next* minute, and v1.x sent the current one.
 - **DCF77**: announces the *next* minute (v1.x clocks ran a minute slow); Sunday was sent as day 0 instead of 7; the DST-change warning bit (A1) is now set.
 - **JJY**: day of year was one day behind.
@@ -23,6 +28,8 @@ This project is a maintained fork of `nisejjy` by SASAKI Taroh, customized for m
 - **No 1970 broadcasts**: the transmitter waits until the clock is actually set, instead of sending 1970 when NTP fails.
 - **Steady timing**: modulation runs from a timer task aligned to the wall clock, so web or Wi-Fi activity can't delay pulses, and NTP corrections re-align on their own.
 - **NTP**: v1.x could permanently disable NTP after one failed boot. NTP now re-syncs hourly and `y0` no longer turns Wi-Fi off.
+
+**Tested.** v2.0.0 was checked end to end on an M5Stack Atom Lite: flashing, Wi-Fi, NTP, the web UI and API ([`tools/device_test.py`](./tools/device_test.py)), the carrier frequency the chip reports for every station, and settings surviving an update. The frame encoders are covered by host tests against the station specs. The other boards are compile-tested; reports are welcome.
 
 ### Upgrading from v1.x
 - Your station, TX, pin, drive strength, LED and DST override settings carry over.
@@ -79,6 +86,8 @@ The antenna pin can be changed in the web UI (Advanced → Antenna pin). Edit [`
 
 **Easiest: install from the browser.** Open **[tanvach.github.io/clocksync](https://tanvach.github.io/clocksync/)** in Chrome or Edge on a computer, pick your board, plug it in by USB and press **Install clocksync**. Nothing to install, no code to compile.
 
+<img src="docs/images/installer.png" alt="The browser installer" width="560">
+
 **Updating** works the same way: open the page, press Install, and leave **Erase device** unticked. Wi-Fi, station, time zone and all other settings are kept: they live in a separate flash area that updates don't touch. (Uploading from the Arduino IDE keeps them too.)
 
 **Or build it yourself.** No libraries beyond the ESP32 board package are needed (Arduino-ESP32 core 3.x).
@@ -104,6 +113,12 @@ The antenna pin can be changed in the web UI (Advanced → Antenna pin). Edit [`
 4.  Rejoin your normal Wi-Fi. The page is now at **`http://clocksync.local`** (or the IP your router assigned).
 
 No internet? Press **Set from this device** to copy the time from your phone, and turn off Internet time under Advanced.
+
+<p>
+  <img src="docs/images/setup.png" alt="First boot: the setup page asks for Wi-Fi" width="300">
+  &nbsp;
+  <img src="docs/images/web-ui-phone.png" alt="The web UI on a phone once connected" width="300">
+</p>
 
 ## Using It
 
@@ -207,13 +222,19 @@ Copy [`secrets_example.h`](./secrets_example.h) to `secrets.h` to pre-load Wi-Fi
 *   **Clock shows the wrong time**:
     *   Leave the time zone on **Auto** for the station's own zone, or pick the zone you want the clock to show (not WWVB, which always sends UTC).
     *   **WWVB clock an hour off**: set the clock's own time zone/DST switch; WWVB carries UTC.
+*   **The browser installer finds no board**:
+    *   Use Chrome or Edge on a computer; phones and Safari can't reach USB devices.
+    *   Use a USB data cable, not a charge-only one.
+    *   On a Mac with Apple silicon, approve the **"Allow accessory to connect?"** prompt the first time you plug the board in (or under System Settings → Privacy & Security).
+    *   Still nothing: hold the board's BOOT button while plugging it in.
 *   **Compile errors**: use the Espressif ESP32 core 3.x (Boards Manager → esp32).
 
 ## Development
 
 ```bash
 make -C test                      # host unit tests for the encoders and the time zone table
-python3 tools/mock_server.py      # web UI with a fake device at http://127.0.0.1:8765/
+python3 tools/mock_server.py      # web UI with a fake device at http://127.0.0.1:8765/ (--configured to skip setup)
+python3 tools/device_test.py clocksync.local   # end-to-end checks against a real device
 python3 tools/gen_tzdata.py > tzdata.h   # refresh time zones from the system's tzdata
 tools/build_installer.sh _site    # build all boards and the browser installer into _site/
 ```

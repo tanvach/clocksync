@@ -145,6 +145,7 @@ a{color:var(--acc);text-decoration:none}
 (function () {
 'use strict';
 var $ = function (id) { return document.getElementById(id); };
+var REPO = 'https://github.com/tanvach/clocksync', INSTALLER = 'https://tanvach.github.io/clocksync/';
 var S = null, base = 0, baseAt = 0, zones = null, pollTimer = 0, lastTrace = '';
 var wifiWatch = null, wifiOpen = false, customPending = false, built = {};
 
@@ -210,7 +211,8 @@ function render(j) {
   baseAt = performance.now();
   var st = station(j.station), w = j.wifi;
   document.title = j.host;
-  $('host').innerHTML = esc(j.host) + '<span>v' + esc(j.version) + '</span>';
+  $('host').innerHTML = esc(j.host) + '<a href="' + REPO + '/releases/tag/v' + esc(j.version) +
+    '" target="_blank" rel="noopener"><span>v' + esc(j.version) + '</span></a>';
 
   var cls, txt;
   if (w.ap && !w.connected) { cls = 'wait'; txt = 'Setup'; }
@@ -267,7 +269,7 @@ function render(j) {
   $('led').checked = j.led;
   setVal('hostname', j.hostSaved || j.host);
   $('about').innerHTML = esc(j.board) + ' · up ' + ago(j.uptime) + (j.ledcHz ? ' · carrier ' + j.ledcHz + ' Hz' : '') +
-    ' · <a href="/status.txt">status.txt</a>';
+    ' · <a href="/status.txt">status.txt</a> · <a href="' + INSTALLER + '" target="_blank" rel="noopener">update</a>';
   tick();
   if (!document.body.classList.contains('ready')) setTimeout(function () { document.body.classList.add('ready'); }, 50);
 }

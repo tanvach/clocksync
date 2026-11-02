@@ -100,7 +100,7 @@ static const ledc_mode_t LEDC_MODE = LEDC_LOW_SPEED_MODE;
 static const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
 static const ledc_channel_t LEDC_CHANNEL = LEDC_CHANNEL_0;
 // 5-bit resolution keeps the LEDC divider fine enough for a carrier within
-// ~30 ppm of nominal (8 bits gives up to ~370 ppm error).
+// ~35 ppm of nominal (8 bits gives up to ~370 ppm error).
 static const int LEDC_BITS = 5;
 static const uint32_t DUTY_HIGH = 16;  // 50 %: strongest fundamental
 static const uint32_t DUTY_LOW = 2;    // 6.25 %: fundamental at ~20 % (-14 dB)
